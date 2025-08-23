@@ -1,0 +1,77 @@
+{
+  "age_years": {
+    "aliases": [
+      "age_years",
+      "RIDAGEYR",
+      "Age",
+      "age"
+    ],
+    "unit": "year"
+  },
+  "albumin": {
+    "aliases": [
+      "albumin",
+      "LBXSAL"
+    ],
+    "unit": "g/dL"
+  },
+  "creatinine": {
+    "aliases": [
+      "creatinine",
+      "LBXSCR"
+    ],
+    "unit": "mg/dL"
+  },
+  "glucose": {
+    "aliases": [
+      "glucose",
+      "LBXSGL"
+    ],
+    "unit": "mg/dL"
+  },
+  "crp_mgL": {
+    "aliases": [
+      "crp",
+      "hscrp",
+      "CRP",
+      "LBXHSCRP"
+    ],
+    "unit": "mg/L"
+  },
+  "lymphocyte_pct": {
+    "aliases": [
+      "lymphocyte_pct",
+      "LBXLYPCT"
+    ],
+    "unit": "%"
+  },
+  "mcv": {
+    "aliases": [
+      "mcv",
+      "LBXMCVSI"
+    ],
+    "unit": "fL"
+  },
+  "rdw": {
+    "aliases": [
+      "rdw",
+      "LBXRDW"
+    ],
+    "unit": "%"
+  },
+  "alk_phosphatase": {
+    "aliases": [
+      "alk_phosphatase",
+      "ALP",
+      "LBXSAPSI"
+    ],
+    "unit": "U/L"
+  },
+  "wbc": {
+    "aliases": [
+      "wbc",
+      "LBXWBCSI"
+    ],
+    "unit": "10^3/uL"
+  }
+}
