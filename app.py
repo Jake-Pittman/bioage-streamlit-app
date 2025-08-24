@@ -1,11 +1,13 @@
 # app.py — ΔPhenoAge Food Recommender with PDF parsing + robust labs sanitize + personalized recs
-import streamlit as st
-st.set_page_config(page_title="ΔPhenoAge Food Recommender", layout="wide", initial_sidebar_state="expanded")
 
 import os, re, io, json, contextlib
 from pathlib import Path
+
 import numpy as np
 import pandas as pd
+import streamlit as st
+
+st.set_page_config(page_title="ΔPhenoAge Food Recommender", layout="wide", initial_sidebar_state="expanded")
 
 # Optional PDF dependency
 try:
@@ -408,6 +410,20 @@ def _attr_tokens(s: str) -> set[str]:
         if m:
             toks.add(m.group(1))
     return toks
+    
+def _attr_weights(s: str) -> dict[str, float]:
+    """
+    Parse 'NUTR_CODE(value);...' into {code: abs(value)} so we can weight strengths.
+    """
+    out = {}
+    if not isinstance(s, str) or not s.strip():
+        return out
+    for chunk in s.split(";"):
+        m = re.search(r"(?:NUTR_)?([A-Z0-9]+)\s*\(([-+]?[\d\.]+)", chunk.strip())
+        if m:
+            out[m.group(1)] = abs(float(m.group(2)))
+    return out
+
 
 def _lab_needs_from_row(row: pd.Series) -> dict[str, set[str]]:
     """Rough, conservative mapping from labs → helpful nutrients / watch-outs."""
@@ -434,7 +450,7 @@ def _lab_needs_from_row(row: pd.Series) -> dict[str, set[str]]:
     return need
 
 def personalize_scores(df: pd.DataFrame, labs_row: pd.Series | None, attr_csv: Path,
-                       base_col="score", out_col="score_use"):
+                       base_col="score", out_col="score_labs"):
     """Adjust scores by labs-driven needs using attribution tokens."""
     df = df.copy()
     df[out_col] = df[base_col].astype(float)
@@ -509,69 +525,436 @@ def build_why_table(ranked_df: pd.DataFrame, attr_csv: Path, top_n=15):
         })
     return pd.DataFrame(rows)
 
-# ---------------- UI ----------------
+# ---------- Preference adjustments (diet/exclusions/dislikes/soft-goals) ----------
+_EXCL_PATTERNS = {
+    "dairy-free":      re.compile(r"\b(milk|cheese|yogurt|kefir|cream|butter|whey|casein|ghee|custard|ice cream)\b", re.I),
+    "gluten-free":     re.compile(r"\b(wheat|barley|rye|farro|couscous|bulgur|seitan)\b", re.I),
+    "nut-free":        re.compile(r"\b(almond|walnut|pecan|hazelnut|pistachio|cashew|macadamia)\b", re.I),
+    "shellfish-free":  re.compile(r"\b(shrimp|prawn|crab|lobster|oyster|clam|scallop|mussel)\b", re.I),
+    "egg-free":        re.compile(r"\b(egg|eggs)\b", re.I),
+    "soy-free":        re.compile(r"\b(soy|soya|tofu|tempeh|edamame|soybean)\b", re.I),
+    "pork-free":       re.compile(r"\b(pork|ham|bacon)\b", re.I),
+}
+
+_DIET_BLOCK = {
+    "Vegan":        re.compile(r"\b(beef|pork|chicken|turkey|lamb|veal|fish|salmon|tuna|shrimp|oyster|clam|crab|lobster|egg|milk|cheese|yogurt|kefir)\b", re.I),
+    "Vegetarian":   re.compile(r"\b(beef|pork|chicken|turkey|lamb|veal|fish|salmon|tuna|shrimp|oyster|clam|crab|lobster)\b", re.I),
+    "Pescatarian":  re.compile(r"\b(beef|pork|chicken|turkey|lamb|veal)\b", re.I),
+    # Mediterranean/DASH/Keto-lite handled as soft-goal nudges only
+}
+
+def apply_preferences(df: pd.DataFrame,
+                      diet_pattern: str,
+                      exclusions: list[str],
+                      dislikes: str,
+                      attr_csv: Path,
+                      base_col="score_labs",
+                      out_col="score_use") -> pd.DataFrame:
+    """
+    - Hard filters: diet_pattern (if Vegan/Vegetarian/Pescatarian) + explicit exclusions + dislikes text.
+    - Soft nudges: sugar/sodium/protein via attribution tokens (added outside via weights).
+    """
+    R = df.copy()
+    # Hard filters
+    desc = R["Desc"].fillna("").astype(str)
+
+    # Diet pattern blocks (only if pattern has hard rules)
+    block_re = _DIET_BLOCK.get(diet_pattern)
+    if block_re is not None:
+        R = R[~desc.str.contains(block_re)]
+
+    # Exclusions
+    for ex in exclusions:
+        ex_re = _EXCL_PATTERNS.get(ex)
+        if ex_re is not None:
+            R = R[~desc.str.contains(ex_re)]
+
+    # Dislikes
+    if dislikes.strip():
+        bads = [re.escape(x.strip()) for x in dislikes.split(",") if x.strip()]
+        if bads:
+            bad_re = re.compile(r"(" + "|".join(bads) + r")", re.I)
+            R = R[~desc.str.contains(bad_re)]
+
+    # Initialize the output score
+    R[out_col] = R[base_col].astype(float)
+
+    # Soft goals via attribution tokens (if available)
+    if attr_csv.exists():
+        with contextlib.suppress(Exception):
+            A = pd.read_csv(attr_csv, usecols=["FoodCode","top_negative_terms","top_positive_terms"])
+            A["FoodCode"] = pd.to_numeric(A["FoodCode"], errors="coerce").astype("Int64")
+            A["_neg"] = A["top_negative_terms"].map(_attr_tokens)   # helpful nutrients present
+            A["_pos"] = A["top_positive_terms"].map(_attr_tokens)   # potential watch-outs
+            R = R.merge(A[["FoodCode","_neg","_pos"]], on="FoodCode", how="left")
+            R["_neg"] = R["_neg"].apply(lambda x: x if isinstance(x, set) else set())
+            R["_pos"] = R["_pos"].apply(lambda x: x if isinstance(x, set) else set())
+
+            # weights (tiny nudges; tune freely)
+            # - sugar penalty if SUGR appears in potential watch-outs
+            R[out_col] += 0.25 * g_min_sugar  * R["_pos"].apply(lambda s: 1 if "SUGR" in s else 0)
+            # - sodium penalty if SODI appears in potential watch-outs (if present in your tokens)
+            R[out_col] += 0.20 * g_min_sodium * R["_pos"].apply(lambda s: 1 if "SODI" in s else 0)
+            # + protein bonus if PROT appears in helpful terms
+            R[out_col] += (-0.20) * g_pref_protein * R["_neg"].apply(lambda s: 1 if "PROT" in s else 0)
+
+            R.drop(columns=["_neg","_pos"], inplace=True, errors="ignore")
+
+    return R
+
+# ---------- Marker targets & severity ----------
+MARKER_MAP = {
+    "glucose": {
+        "label": "Glucose", "units": "mg/dL", "dir": "high", "goal": (70, 99),
+        "helps": {"FIBE", "PROT", "PFAT", "MFAT", "VK", "VC"},
+        "avoid": {"SUGR"}
+    },
+    "crp_mgL": {
+        "label": "CRP (hs)", "units": "mg/L", "dir": "high", "goal": (0.0, 3.0),
+        "helps": {"VC", "ATOC", "SELE", "ZINC", "FIBE", "PFAT"},
+        "avoid": {"SFAT"}
+    },
+    "albumin": {
+        "label": "Albumin", "units": "g/dL", "dir": "low", "goal": (3.8, 5.0),
+        "helps": {"PROT", "ZINC", "SELE"},
+        "avoid": set()
+    },
+    "lymphocyte_pct": {
+        "label": "Lymphocytes", "units": "%", "dir": "low", "goal": (20, 40),
+        "helps": {"VC", "ZINC", "SELE"},
+        "avoid": set()
+    },
+    "rdw": {
+        "label": "RDW", "units": "%", "dir": "high", "goal": (11.5, 14.5),
+        "helps": {"FDFE", "VB12", "VB6"},
+        "avoid": set()
+    },
+    "alk_phosphatase": {
+        "label": "Alk Phosphatase", "units": "U/L", "dir": "high", "goal": (44, 120),
+        "helps": {"VK", "VARA", "VC"},
+        "avoid": set()
+    },
+    "wbc": {
+        "label": "WBC", "units": "10^3/µL", "dir": "high", "goal": (4.0, 10.5),
+        "helps": {"VC", "ATOC", "SELE", "ZINC"},
+        "avoid": set()
+    },
+    "creatinine": {
+        "label": "Creatinine", "units": "mg/dL", "dir": "high", "goal": (0.6, 1.3),
+        "helps": {"FIBE", "PFAT", "MFAT"},
+        "avoid": set()
+    },
+    "mcv": {
+        "label": "MCV", "units": "fL", "dir": "high", "goal": (80, 100),
+        "helps": {"VB12", "FDFE"},
+        "avoid": set()
+    },
+}
+
+def _status_and_severity(value: float | None, goal: tuple[float, float] | None, direc: str) -> tuple[str, float]:
+    """
+    Returns (status, severity in [0,1]).
+    status: 'high', 'low', or 'ok' relative to goal and direction of risk.
+    Severity ramps from 0 at the edge of goal to 1 at a far-out value.
+    """
+    if value is None or goal is None:
+        return ("ok", 0.0)
+    lo, hi = goal
+    if direc == "high":
+        if value <= hi: return ("ok", 0.0)
+        sev = (value - hi) / max(1.0, hi)
+        return ("high", float(np.clip(sev, 0.0, 1.0)))
+    elif direc == "low":
+        if value >= lo: return ("ok", 0.0)
+        sev = (lo - value) / max(1.0, lo if lo else 1.0)
+        return ("low", float(np.clip(sev, 0.0, 1.0)))
+    else:
+        return ("ok", 0.0)
+
+def compute_marker_severity(labs_row: pd.Series) -> dict:
+    """
+    For each marker in MARKER_MAP, compute:
+      - value, status ('high'/'low'/'ok'), severity [0,1].
+    """
+    out = {}
+    for key, meta in MARKER_MAP.items():
+        val = labs_row.get(key)
+        try:
+            val = None if pd.isna(val) else float(val)
+        except Exception:
+            val = None
+        status, sev = _status_and_severity(val, meta.get("goal"), meta.get("dir", "ok"))
+        out[key] = {
+            "value": val,
+            "status": status,
+            "severity": sev,
+            "label": meta["label"],
+            "units": meta["units"]
+        }
+    return out
+# Marker-specific nutrient priorities (positive helps, negative = avoid)
+MARKER_WEIGHTS = {
+    "glucose":       {"FIBE": 1.0, "PROT": 0.8, "PFAT": 0.4, "MFAT": 0.4, "VK": 0.2, "VC": 0.2, "SUGR": -1.0},
+    "crp_mgL":       {"VC": 0.8, "SELE": 0.7, "ZINC": 0.7, "ATOC": 0.6, "FIBE": 0.3, "PFAT": 0.3, "SFAT": -0.8},
+    "albumin":       {"PROT": 1.0, "ZINC": 0.4, "SELE": 0.4},
+    "lymphocyte_pct":{"VC": 0.9, "ZINC": 0.7, "SELE": 0.7},
+    "rdw":           {"FDFE": 0.9, "VB12": 0.7, "VB6": 0.4},
+    "alk_phosphatase":{"VK": 0.8, "VARA": 0.5, "VC": 0.3},
+    "wbc":           {"VC": 0.8, "SELE": 0.6, "ZINC": 0.6, "ATOC": 0.5},
+    "creatinine":    {"FIBE": 0.5, "PFAT": 0.4, "MFAT": 0.4},
+    "mcv":           {"VB12": 0.9, "FDFE": 0.7},
+}
+
+def foods_by_marker(R: pd.DataFrame,
+                    attr_csv: Path,
+                    marker_sev: dict,
+                    top_k: int = 10) -> dict[str, pd.DataFrame]:
+    """
+    Use weighted nutrient attribution per marker:
+      impact = severity * ( Σ w_marker[n]*neg_weight[n]  -  0.6*Σ |w_marker[m]|*pos_weight[m] )
+    where:
+      - neg_weight = weight from 'top_negative_terms' (nutrients that help the core score)
+      - pos_weight = weight from 'top_positive_terms' (watch-outs)
+      - w_marker   = marker-specific priority (MARKER_WEIGHTS)
+    Then add a small global desirability bonus from score_use.
+    """
+    out = {}
+    if R is None or R.empty or not attr_csv.exists():
+        return out
+
+    try:
+        A = pd.read_csv(attr_csv, usecols=["FoodCode","Desc","top_negative_terms","top_positive_terms"])
+    except Exception:
+        return out
+
+    A["FoodCode"] = pd.to_numeric(A["FoodCode"], errors="coerce").astype("Int64")
+
+    # Parse to dicts of weights instead of sets
+    A["_negw"] = A["top_negative_terms"].map(_attr_weights)   # helpful nutrients w/ strength
+    A["_posw"] = A["top_positive_terms"].map(_attr_weights)   # watch-outs w/ strength
+
+    J = R.merge(A[["FoodCode","_negw","_posw"]], on="FoodCode", how="left")
+    J["_negw"] = J["_negw"].apply(lambda d: d if isinstance(d, dict) else {})
+    J["_posw"] = J["_posw"].apply(lambda d: d if isinstance(d, dict) else {})
+
+    # Precompute small global bonus from score_use (keep it small so marker dominates)
+    su = J["score_use"].astype(float)
+    su_rank = su.rank(method="average", ascending=True)
+    inv_bonus = (su_rank.max() - su_rank + 1) / su_rank.max()  # ~1 best, ~0 worst
+    global_bonus = 0.15 * inv_bonus  # was 0.3 before; make it smaller
+
+    rows_by_marker = {}
+
+    for key, meta in MARKER_MAP.items():
+        sev = marker_sev.get(key, {}).get("severity", 0.0)
+        if sev <= 0:
+            sev = 0.10  # tiny list even if marker okay
+
+        # choose nutrient priorities
+        wmark = MARKER_WEIGHTS.get(key, {})
+        helps = meta.get("helps", set())
+        avoid = meta.get("avoid", set())
+
+        # If MARKER_WEIGHTS not provided for some tokens, fall back to +0.3 for helps / -0.5 for avoids
+        def w_for(code: str) -> float:
+            if code in wmark:
+                return float(wmark[code])
+            if code in helps:
+                return 0.30
+            if code in avoid:
+                return -0.50
+            return 0.0
+
+        help_scores = []
+        avoid_scores = []
+
+        for negw, posw in zip(J["_negw"], J["_posw"]):
+            # weighted sum of matching tokens
+            h = sum(w_for(tok) * float(negw.get(tok, 0.0)) for tok in set(list(negw.keys()) + list(wmark.keys())))
+            a = sum(abs(w_for(tok)) * float(posw.get(tok, 0.0)) for tok in set(list(posw.keys()) + list(wmark.keys())))
+            help_scores.append(h)
+            avoid_scores.append(a)
+
+        help_scores = pd.Series(help_scores, index=J.index).astype(float)
+        avoid_scores = pd.Series(avoid_scores, index=J.index).astype(float)
+
+        impact = sev * (help_scores - 0.6 * avoid_scores)
+
+        total = 0.85 * impact + global_bonus  # marker dominates
+
+        dfk = J.assign(
+            impact_score=total,
+            why_help=J["_negw"].apply(
+                lambda d: ", ".join(
+                    _PRETTY.get(k, k)
+                    for k, v in sorted(d.items(), key=lambda kv: -kv[1]) if w_for(k) > 0
+                )[:100] if d else "—"
+            ),
+            why_watch=J["_posw"].apply(
+                lambda d: ", ".join(
+                    _PRETTY.get(k, k)
+                    for k, v in sorted(d.items(), key=lambda kv: -kv[1]) if w_for(k) < 0
+                )[:100] if d else "—"
+            )
+        ).sort_values("impact_score", ascending=False)
+
+        rows_by_marker[key] = dfk[["FoodCode","Desc","score_use","impact_score","why_help","why_watch"]].head(top_k)
+
+    return rows_by_marker
+
+
+def render_category_tabs(R_all: pd.DataFrame, top_n_show: int):
+    """Render the 6 category tabs using the personalized 'score_use' column."""
+    tabs = st.tabs(["Protein", "Fats", "Fruit", "Vegetables", "Legume/Grains", "Other"])
+    CAT_ORDER = ["protein","fats","fruit","vegetables","legume_grains","other"]
+    QUOTA = {"protein": 5, "fats": 5, "fruit": 7, "vegetables": 10, "legume_grains": 4, "other": top_n_show}
+
+    for tab, cat in zip(tabs, CAT_ORDER):
+        with tab:
+            sub = (
+                R_all[R_all["category"] == cat]
+                .sort_values("score_use")
+                .head(QUOTA.get(cat, top_n_show))
+            )
+            if sub.empty:
+                st.info(f"No foods found for category: {cat.replace('_','/')}")
+            else:
+                st.write(f"**Top {len(sub)} — {cat.replace('_','/').title()}**")
+                st.dataframe(
+                    sub[["FoodCode","Desc","kcal_per_100g","score_use","tags"]]
+                       .rename(columns={"score_use":"score"}),
+                    use_container_width=True
+                )
+                st.download_button(
+                    f"Download {cat.replace('_','/').title()} (CSV)",
+                    sub.to_csv(index=False).encode("utf-8"),
+                    file_name=f"top_{cat}.csv",
+                    key=f"dl_{cat}"
+                )
+
+def render_marker_cards(R_all: pd.DataFrame, labs_row: pd.Series):
+    """Marker cards section."""
+    st.subheader("Foods by marker (personalized)")
+    marker_sev = compute_marker_severity(labs_row)
+    by_marker = foods_by_marker(R_all, ATTR_CSV, marker_sev, top_k=10)
+
+    cols = st.columns(2)
+    i = 0
+    for key, meta in MARKER_MAP.items():
+        info = marker_sev.get(key, {})
+        val = info.get("value")
+        status = info.get("status")
+        units = meta["units"]
+        label = meta["label"]
+
+        # simple status glyph
+        color = "✅"
+        if status == "high": color = "🔺"
+        if status == "low":  color = "🔻"
+
+        with cols[i % 2]:
+            # keep simple container for wide compatibility
+            with st.container():
+                st.markdown(f"**{label}** — {color} {('%.2f' % val) if val is not None else '—'} {units}")
+                dfk = by_marker.get(key)
+                if dfk is None or dfk.empty:
+                    st.caption("No strong matches — try relaxing filters.")
+                else:
+                    show = dfk[["FoodCode","Desc","score_use","impact_score","why_help","why_watch"]].copy()
+                    show = show.rename(columns={"score_use":"score", "impact_score":"impact"})
+                    st.dataframe(show, use_container_width=True, hide_index=True)
+        i += 1
+
+# ============================ UI ============================
 st.title("ΔPhenoAge Food Recommender")
 
+# ===== Sidebar =====
 with st.sidebar:
     st.markdown("**Paths**")
     st.text(f"Root: {root}")
     if not CAT_PARQUET.exists():
         st.error("Missing app assets. Please generate:\n- app_assets/food_catalog.parquet")
+
+    # Filters
     include_tags = st.text_input("Include tags (comma-separated)", value="")
     exclude_tags = st.text_input("Exclude tags (comma-separated)", value="")
-    top_n_show = st.slider("Rows to show", 20, 200, 100, step=10)
+
+    # Preferences
+    st.markdown("**Preferences**")
+    diet_pattern = st.selectbox(
+        "Diet pattern",
+        ["Omnivore", "Pescatarian", "Vegetarian", "Vegan", "Mediterranean", "DASH", "Keto-lite"],
+        index=0
+    )
+    exclusions = st.multiselect(
+        "Hard exclusions",
+        ["dairy-free", "gluten-free", "nut-free", "shellfish-free", "egg-free", "soy-free", "pork-free"],
+        default=[]
+    )
+    dislikes = st.text_input("Avoid ingredients (comma-separated)", value="")
+
+    st.caption("Soft goals (tune ranking, not a hard filter)")
+    g_min_sugar    = st.slider("Minimize added sugar",        0.0, 1.0, 0.3, 0.1)
+    g_min_sodium   = st.slider("Minimize sodium",             0.0, 1.0, 0.0, 0.1)
+    g_pref_protein = st.slider("Prefer higher-protein foods", 0.0, 1.0, 0.3, 0.1)
+
+    top_n_show = st.slider("How many foods to show in table views", 20, 200, 100, step=10)
+
     st.markdown("---")
     if TEMPLATE_CSV.exists():
-        st.download_button("Download labs CSV template",
-                           TEMPLATE_CSV.read_bytes(), file_name="labs_upload_template.csv")
+        st.download_button(
+            "Download labs CSV template",
+            TEMPLATE_CSV.read_bytes(),
+            file_name="labs_upload_template.csv"
+        )
     if not HAS_PDFPLUMBER:
         st.info("PDF parsing needs `pdfplumber` → `pip install pdfplumber`")
 
-schema  = load_lab_schema()
-catalog = load_catalog() if CAT_PARQUET.exists() else None
+    schema  = load_lab_schema()
+    catalog = load_catalog() if CAT_PARQUET.exists() else None
 
-# -------- 1) Upload labs (PDF or CSV) + age --------
-st.subheader("1) Upload your blood test (PDF preferred) and enter your age")
-c_up1, c_up2 = st.columns(2)
-with c_up1:
-    pdf_file = st.file_uploader("Upload PDF blood test", type=["pdf"])
-with c_up2:
-    csv_file = st.file_uploader("Or upload CSV (headers may use aliases)", type=["csv"])
-age_input = st.number_input("Your age (years)", min_value=0, max_value=120, value=45)
+    # -------- 1) Upload labs (PDF or CSV) + age --------
+    st.subheader("1) Upload your blood test (PDF preferred) and enter your age")
+    c_up1, c_up2 = st.columns(2)
+    with c_up1:
+        pdf_file = st.file_uploader("Upload PDF blood test", type=["pdf"])
+    with c_up2:
+        csv_file = st.file_uploader("Or upload CSV (headers may use aliases)", type=["csv"])
+    age_input = st.number_input("Your age (years)", min_value=0, max_value=120, value=45)
 
-run_clicked = st.button("Run model on uploaded labs → compute BioAge & recommend foods")
+    run_clicked = st.button("Run model on uploaded labs → compute BioAge & recommend foods")
 
-parsed_df = None
-if run_clicked:
-    labs_dict = {}
-    try:
-        if pdf_file is not None:
-            data = pdf_file.read()
-            raw_labs = parse_pdf_labs(io.BytesIO(data))
-            labs_dict = sanitize_labs(raw_labs)
-        elif csv_file is not None:
-            raw = pd.read_csv(csv_file)
-            norm = normalize_labs(raw, schema)
-            labs_dict = sanitize_labs(norm.iloc[0].to_dict())
-        else:
-            st.error("Please upload a PDF or CSV first.")
-    except Exception as e:
-        st.error(f"Failed to parse labs: {e}")
+    parsed_df = None
+    if run_clicked:
+        labs_dict = {}
+        try:
+            if pdf_file is not None:
+                data = pdf_file.read()
+                raw_labs = parse_pdf_labs(io.BytesIO(data))
+                labs_dict = sanitize_labs(raw_labs)
+            elif csv_file is not None:
+                raw = pd.read_csv(csv_file)
+                norm = normalize_labs(raw, schema)
+                labs_dict = sanitize_labs(norm.iloc[0].to_dict())
+            else:
+                st.error("Please upload a PDF or CSV first.")
+        except Exception as e:
+            st.error(f"Failed to parse labs: {e}")
 
-    if labs_dict:
-        mapped = {
-            "age_years": age_input,
-            "albumin": labs_dict.get("albumin"),
-            "creatinine": labs_dict.get("creatinine"),
-            "glucose": labs_dict.get("fasting_glucose") or labs_dict.get("glucose"),
-            "crp_mgL": labs_dict.get("crp"),
-            "lymphocyte_pct": labs_dict.get("lymphs"),
-            "mcv": labs_dict.get("mcv"),
-            "rdw": labs_dict.get("rdw"),
-            "alk_phosphatase": labs_dict.get("alp"),
-            "wbc": labs_dict.get("wbc"),
-        }
-        parsed_df = pd.DataFrame([mapped])
+        if labs_dict:
+            mapped = {
+                "age_years": age_input,
+                "albumin": labs_dict.get("albumin"),
+                "creatinine": labs_dict.get("creatinine"),
+                "glucose": labs_dict.get("fasting_glucose") or labs_dict.get("glucose"),
+                "crp_mgL": labs_dict.get("crp"),
+                "lymphocyte_pct": labs_dict.get("lymphs"),
+                "mcv": labs_dict.get("mcv"),
+                "rdw": labs_dict.get("rdw"),
+                "alk_phosphatase": labs_dict.get("alp"),
+                "wbc": labs_dict.get("wbc"),
+            }
+            parsed_df = pd.DataFrame([mapped])
 
 # -------- 2) Show normalized labs & BioAge --------
 st.subheader("2) Parsed labs & BioAge")
@@ -587,53 +970,49 @@ else:
 
 # -------- 3) Food recommendations (personalized) --------
 st.subheader("3) Food recommendations")
-if (parsed_df is not None) and (catalog is not None) and len(catalog):
 
-    # De-duplicate & categorize
+if parsed_df is None:
+    st.info("Upload a PDF/CSV, enter age, then click the button to get recommendations.")
+elif catalog is None:
+    st.error("Food catalog not found. Re-run your data prep to create app_assets/food_catalog.parquet.")
+else:
+    # 1) Filter + de-duplicate
     R_all = dedup_rank(catalog, include_tags, exclude_tags)
     R_all["category"] = [coarse_category(d, t) for d, t in zip(R_all["Desc"], R_all["tags"])]
 
-    # PERSONALIZE once, then sort & use 'score_use' everywhere
-    R_all = personalize_scores(R_all, parsed_df.iloc[0], ATTR_CSV, base_col="score", out_col="score_use")
+    # 2) Personalize by labs -> score_labs
+    R_all = personalize_scores(
+        R_all, parsed_df.iloc[0], ATTR_CSV,
+        base_col="score", out_col="score_labs"
+    )
+
+    # 3) Apply preferences -> score_use
+    R_all = apply_preferences(
+        R_all, diet_pattern, exclusions, dislikes, ATTR_CSV,
+        base_col="score_labs", out_col="score_use"
+    )
+
+    # 4) Sort and show
     R_all = R_all.sort_values("score_use", ascending=True).reset_index(drop=True)
 
-    # Top 100 by personalized score
     top_overall = R_all.head(100).copy()
-    st.markdown("**Top 100 overall (personalized; lower = better)**")
+    st.markdown("**Top 100 overall (personalized — lower is better)**")
     st.dataframe(
-        top_overall[["FoodCode","Desc","kcal_per_100g","score_use","score","tags","category"]]
-                   .head(top_n_show),
+        top_overall[["FoodCode","Desc","kcal_per_100g","score_use","tags","category"]]
+                   .rename(columns={"score_use":"score"}),
         use_container_width=True
     )
 
-    tabs = st.tabs(["Protein", "Fats", "Fruit", "Vegetables", "Legume/Grains", "Other"])
-    QUOTA = {"protein": 5, "fats": 5, "fruit": 7, "vegetables": 10, "legume_grains": 4, "other": 10}
-    CAT_ORDER = ["protein","fats","fruit","vegetables","legume_grains","other"]
+    # Category tabs
+    render_category_tabs(R_all, top_n_show)
 
-    for tab, cat in zip(tabs, CAT_ORDER):
-        with tab:
-            sub = R_all[R_all["category"] == cat].sort_values("score_use").head(QUOTA.get(cat, 10))
-            if sub.empty:
-                st.info(f"No foods found for category: {cat.replace('_','/')}")
-            else:
-                st.write(f"**Top {len(sub)} — {cat.replace('_','/').title()}** (personalized score)")
-                st.dataframe(sub[["FoodCode","Desc","kcal_per_100g","score_use","tags"]], use_container_width=True)
-                st.download_button(
-                    f"Download {cat.replace('_','/').title()} (CSV)",
-                    sub.to_csv(index=False).encode("utf-8"),
-                    file_name=f"top_{cat}.csv",
-                    key=f"dl_{cat}"
-                )
+    # Marker cards
+    render_marker_cards(R_all, parsed_df.iloc[0])
 
-    # Why these foods? (top-N by personalized score)
+    # Why these foods?
     why = build_why_table(top_overall, ATTR_CSV, top_n=15)
     if why is not None and len(why):
         st.subheader("Why these foods?")
         st.caption("Top nutrients driving each pick — helpful vs potential watch-outs, matched to your labs.")
         st.dataframe(why, use_container_width=True)
-
-elif parsed_df is None:
-    st.info("Upload a PDF/CSV, enter age, then click the button to get recommendations.")
-elif catalog is None:
-    st.error("Food catalog not found. Create app_assets/food_catalog.parquet.")
 
