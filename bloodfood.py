@@ -15,10 +15,7 @@ import streamlit as st
 APP_BUILD = "bf-v2-loader"
 st.sidebar.caption(f"Build: {APP_BUILD}")
 
-# If these show up, you still have old code; this helps catch it
-for _name in ("PERFOOD_DIR", "PERFOOD_ALT"):
-    if _name in globals():
-        st.sidebar.warning(f"Remove legacy global: {_name}")
+
 
 # =============================================================================
 # Page + Paths
