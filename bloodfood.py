@@ -3,19 +3,14 @@
 # - Loads per-food LightGBM models (joblib) + scaler → predicts marker deltas per food
 # - Blends BioAge score with per-marker impact + dietary preferences
 
-import os, io, re, json, contextlib, glob
+# ---- imports (keep yours) ----
+import os, re, io, json, contextlib
 from pathlib import Path
-
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-# third-party model utils
-from joblib import load as joblib_load
-
-st.set_page_config(page_title="Blood→Food (BioAge + Marker ML)", layout="wide", initial_sidebar_state="expanded")
-
-# ---------------- Paths ----------------
+# ---------------- Paths (MUST be defined before loaders) ----------------
 REPO_ROOT = Path(__file__).resolve().parent
 env_root  = os.environ.get("BIOAGE_ROOT")
 root      = Path(env_root) if env_root else REPO_ROOT
@@ -24,18 +19,14 @@ PROC   = root / "processed"
 ASSETS = root / "app_assets"
 CORE   = root / "models" / "RewardModel" / "core_scoring"
 
-# Catalog + attribution
+FND_PARQUET    = PROC / "FNDDS_MASTER_PER100G.parquet"
 CAT_PARQUET    = ASSETS / "food_catalog.parquet"
-FND_PARQUET    = PROC / "FNDDS_MASTER_PER100G.parquet"   # expected to hold NUTR_* features
-ATTR_CSV       = CORE / "core_food_attribution_top50_compact.csv"  # (optional for "why" & prefs nudges)
+LAB_SCHEMA_JS  = ASSETS / "lab_schema.json"
+TEMPLATE_CSV   = ASSETS / "labs_upload_template.csv"
+CONSENSUS_CSV  = CORE / "consensus_food_scores.csv"
+GUARDRAILS_CSV = CORE / "core_food_scores_guardrails.csv"
+ATTR_CSV       = CORE / "core_food_attribution_top50_compact.csv"  # optional
 
-# Per-food ML models (you can keep your joblibs here)
-PERFOOD_DIR    = root / "models" / "PerFood"
-PERFOOD_ALT    = root / "models" / "perfood"  # fallback if you name the folder differently
-
-SCALER_FILE    = "X_scaler.joblib"
-R2_FILE        = "per_target_r2.csv"
-META_FILE      = "meta.json"
 
 # ---------------- Optional dependency: pdfplumber ----------------
 try:
@@ -105,7 +96,9 @@ def load_fnd_features() -> pd.DataFrame | None:
             return out
     return None
 
-
+schema   = load_lab_schema()
+catalog  = load_catalog() if CAT_PARQUET.exists() else None
+fnd_nutr = load_fnd_features()
 
 # ---------------- Dedup + categories used in UI ----------------
 _STOPWORDS = re.compile(
