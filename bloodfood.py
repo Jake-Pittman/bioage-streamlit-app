@@ -64,6 +64,15 @@ def robust_z(x: pd.Series) -> pd.Series:
 
 def clip01(v): return float(np.clip(v, 0.0, 1.0))
 
+def _dedupe_by_desc(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop near-duplicate rows by normalized description."""
+    if "Desc" not in df.columns:
+        return df
+    df = df.copy()
+    df["dedup_key"] = df["Desc"].map(_normalize_desc)
+    df = df.drop_duplicates("dedup_key", keep="first")
+    return df
+
 # =============================================================================
 # Loaders
 # =============================================================================
@@ -818,24 +827,60 @@ else:
     )
 
     # 8) marker cards
+# 8) Marker cards (from per-marker impacts, if any)
     st.subheader("Foods by marker (model-targeted)")
-    cols = st.columns(2); i = 0
-    for mkey, meta in MARKER_MAP.items():
+
+    # Show higher-severity markers first, so their picks get priority in cross-card de-dupe
+    ordered_markers = sorted(
+        MARKER_MAP.keys(),
+        key=lambda k: sev.get(k, {}).get("severity", 0.0),
+        reverse=True
+    )
+
+    cols = st.columns(2)
+    i = 0
+    used_keys: set[str] = set()   # track normalized descs used on earlier cards
+
+    for mkey in ordered_markers:
+        meta = MARKER_MAP[mkey]
         info = sev.get(mkey, {})
-        val = info.get("value"); status = info.get("status"); units = meta["units"]; label = meta["label"]
+        val = info.get("value"); status = info.get("status")
+        units = meta["units"]; label = meta["label"]
         glyph = "🔺" if status == "high" else ("🔻" if status == "low" else "✅")
-        with cols[i % 2]:
-            with st.container():
-                st.markdown(f"**{label}** — {glyph} {('%.2f' % val) if val is not None else '—'} {units}")
-                dfk = per_marker_tables.get(mkey)
-                if dfk is None or dfk.empty:
+
+        # fetch the table we built during scoring
+        dfk = per_marker_tables.get(mkey)
+        if dfk is None or dfk.empty:
+            with cols[i % 2]:
+                with st.container():
+                    st.markdown(f"**{label}** — {glyph} {('%.2f' % val) if val is not None else '—'} {units}")
                     st.caption("No model or no strong matches for this marker.")
-                else:
-                    show = (dfk.sort_values("impact_score", ascending=False)
-                              .head(10)[["FoodCode","Desc","impact_score"]]
-                              .rename(columns={"impact_score":"impact"}))
-                    st.dataframe(show, use_container_width=True, hide_index=True)
-        i += 1
+            i += 1
+            continue
+
+    # 1) de-dupe within the card
+    dfk = _dedupe_by_desc(dfk)
+
+    # 2) de-dupe across cards (skip foods already shown on earlier, higher-severity cards)
+    if "dedup_key" not in dfk.columns:
+        dfk["dedup_key"] = dfk["Desc"].map(_normalize_desc)
+    dfk = dfk[~dfk["dedup_key"].isin(used_keys)]
+
+    # sort and take top-N
+    dfk = dfk.sort_values("impact_score", ascending=False).head(10)
+
+    # record the ones we just used so later cards won’t repeat them
+    used_keys |= set(dfk["dedup_key"].tolist())
+
+    with cols[i % 2]:
+        with st.container():
+            st.markdown(f"**{label}** — {glyph} {('%.2f' % val) if val is not None else '—'} {units}")
+            if dfk.empty:
+                st.caption("No unique picks after de-duplication.")
+            else:
+                show = dfk[["FoodCode","Desc","impact_score"]].rename(columns={"impact_score":"impact"})
+                st.dataframe(show, use_container_width=True, hide_index=True)
+    i += 1
 
     # 9) category tabs
     st.subheader("Browse by category")
