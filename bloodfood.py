@@ -216,69 +216,64 @@ def parse_pdf_labs(file_like) -> dict:
     if not HAS_PDFPLUMBER:
         raise RuntimeError("pdfplumber not installed. Run: pip install pdfplumber")
 
-    # ---- label synonyms (longest first match wins) ----
+    # ---- label synonyms (longest-first wins) ----
     synonyms = [
-        # name, canonical_key
+        # Albumin
         ("serum albumin", "albumin"), ("albumin, serum", "albumin"),
         ("albumin (serum)", "albumin"), ("alb", "albumin"), ("albumin", "albumin"),
 
+        # Alkaline phosphatase (many ways)
         ("alkaline phosphatase (total)", "alp"), ("alkaline phosphatase, total", "alp"),
         ("alkaline phosphatase (alp)", "alp"), ("alkaline phosphatase (alk phos)", "alp"),
-        ("alkaline phosphatase serum", "alp"),            # NEW
-        ("alkaline phosphatase total", "alp"),            # NEW
-        ("alkaline phosph", "alp"),                       # NEW (truncated label)
-        ("alk phosphate", "alp"),                         # NEW (common variant)
-        ("alk phosph", "alp"),                            # NEW (short variant)
         ("alk phosphatase", "alp"), ("alk. phosphatase", "alp"),
-        ("alk phos total", "alp"),                        # NEW
-        ("alk phos, total", "alp"),                       # NEW
         ("alk phos", "alp"), ("alk-phos", "alp"),
-        ("alkaline phosphatase", "alp"),
-        ("alp", "alp"),
+        ("alkaline phosphatase", "alp"), ("alkaline phosphate", "alp"), ("alp", "alp"),
 
-
+        # CRP
         ("c-reactive protein, cardiac", "crp"), ("c-reactive protein (cardiac)", "crp"),
         ("c reactive protein, cardiac", "crp"), ("crp, cardiac", "crp"),
         ("high sensitivity crp", "crp"), ("hs-crp", "crp"), ("hscrp", "crp"),
         ("c-reactive protein", "crp"), ("c reactive protein", "crp"), ("crp", "crp"),
 
+        # Glucose
         ("glucose, fasting", "fasting_glucose"), ("glucose (fasting)", "fasting_glucose"),
         ("fasting glucose", "fasting_glucose"), ("glucose fasting", "fasting_glucose"),
         ("glucose", "fasting_glucose"),
 
+        # WBC
         ("white blood cell count", "wbc"), ("white blood cells", "wbc"),
         ("white blood cell", "wbc"), ("wbc", "wbc"),
 
+        # Lymphocytes
         ("lymphocytes absolute", "lymphs_abs"), ("absolute lymphocytes", "lymphs_abs"),
         ("abs lymphocytes", "lymphs_abs"), ("lymphs #", "lymphs_abs"),
         ("lymphocyte percent", "lymphs_pct"), ("lymphocytes percent", "lymphs_pct"),
         ("lymphocyte %", "lymphs_pct"), ("lymphocytes %", "lymphs_pct"),
         ("lymphocytes", "lymphs_pct"), ("lymphs", "lymphs_pct"),
 
+        # RBC indices
         ("mean corpuscular volume", "mcv"), ("mcv", "mcv"),
         ("red cell distribution width", "rdw"), ("rdw", "rdw"),
 
+        # Extras
         ("creatinine", "creatinine"), ("creat", "creatinine"),
         ("blood urea nitrogen", "bun"), ("bun", "bun"),
     ]
 
-    # regex helpers
-    range_pat  = re.compile(r"\b\d+(?:\.\d+)?\s*[-–]\s*\d+(?:\.\d+)?\b")
-    number_pat = re.compile(r"(-?\d+(?:\.\d+)?)")
+    # ---- regex helpers ----
+    range_pat   = re.compile(r"\b\d+(?:\.\d+)?\s*[-–]\s*\d+(?:\.\d+)?\b")
+    number_pat  = re.compile(r"(-?\d+(?:\.\d+)?)")
     percent_pat = re.compile(r"%")
 
-    def norm(s: str) -> str:
-        return (s or "").strip().lower()
-
     def match_key(lbl: str) -> str | None:
-        s = norm(lbl)
+        s = (lbl or "").strip().lower()
         for name, key in sorted(synonyms, key=lambda kv: -len(kv[0])):  # longest first
             if name in s:
                 return key
         return None
 
     def first_numeric(txt: str, prefer_percent=False):
-        """Return first numeric value if this cell is not a range; prefer cells containing '%' when asked."""
+        """Return (value, score) if numeric present and not a range; prefer '%' when asked."""
         if not txt:
             return None, None
         if range_pat.search(txt):
@@ -288,21 +283,19 @@ def parse_pdf_labs(file_like) -> dict:
             return None, None
         val = float(m.group(1))
         has_pct = bool(percent_pat.search(txt))
-        # tiny bias to prefer percent-labelled cells when we’re after lymphocyte%
         score = (1 if (prefer_percent and has_pct) else 0, -len(txt))
         return val, score
 
     labs: dict = {}
-    aux: dict  = {}      # holds lymphs_abs, lymphs_pct if needed later
-    evidence = {}        # for optional debug in UI
+    aux: dict  = {}      # holds lymphs_abs, lymphs_pct
+    evidence = {}
 
     # ---- Pass 1: tables ----
     with pdfplumber.open(file_like) as pdf:
         for page in pdf.pages:
-            tables = page.extract_tables() or []
-            for tbl in tables:
+            for tbl in (page.extract_tables() or []):
                 for r_i, row in enumerate(tbl or []):
-                    if not row or all(c is None or str(c).strip()=="" for c in row):
+                    if not row or all(c is None or str(c).strip() == "" for c in row):
                         continue
                     label = str(row[0] or "")
                     key = match_key(label)
@@ -310,9 +303,9 @@ def parse_pdf_labs(file_like) -> dict:
                         continue
 
                     prefer_pct = (key == "lymphs_pct")
-                    best = None   # (score, value, raw_text)
+                    best = None  # (score, value, raw_text)
 
-                    # check cells to the right on the same row
+                    # cells to the right
                     for cell in row[1:]:
                         txt = str(cell or "")
                         val, score = first_numeric(txt, prefer_percent=prefer_pct)
@@ -322,20 +315,20 @@ def parse_pdf_labs(file_like) -> dict:
                         if (best is None) or (cand > best):
                             best = cand
 
-                    # if nothing on the same row, look one row below same column (common lab layout)
+                    # sometimes the value is directly below the header
                     if best is None and len(row) > 1 and r_i + 1 < len(tbl):
-                        below = str((tbl[r_i+1] or [""])[1] or "")
+                        below = str((tbl[r_i + 1] or [""])[1] or "")
                         val, score = first_numeric(below, prefer_percent=prefer_pct)
                         if val is not None:
-                            best = ((score, val, below))
+                            best = (score, val, below)
 
                     if best is None:
                         continue
 
                     _, value, rawtxt = best
-                    lowtxt = rawtxt.lower()
+                    lowtxt = (rawtxt or "").lower()
 
-                    # Unit fixes at capture time
+                    # unit fixes at capture time
                     if key == "crp" and ("mg/dl" in lowtxt) and ("mg/l" not in lowtxt):
                         value *= 10.0
                     if key == "albumin" and "g/l" in lowtxt:
@@ -348,24 +341,20 @@ def parse_pdf_labs(file_like) -> dict:
                         aux["lymphs_pct"] = value
                         evidence["lymphs_pct"] = (value, rawtxt)
                     elif key == "wbc":
-                        # capture possible scale hints: "x10^3/uL", "10*3/uL", etc.
-                        if re.search(r"x\s*10\^?3\s*/?\s*u?l", lowtxt) or re.search(r"10\*?3", lowtxt):
-                            # this is already in 10^3/µL; we'll normalize later anyway
-                            pass
                         labs["wbc"] = value
                         evidence["wbc"] = (value, rawtxt)
                     else:
                         labs[key] = value
                         evidence[key] = (value, rawtxt)
 
-    # ---- Pass 2: text fallback (simple label→value window search) ----
+    # ---- Pass 2: text fallback ----
     file_like.seek(0)
     full_text = ""
     with pdfplumber.open(file_like) as pdf:
         for p in pdf.pages:
             full_text += (p.extract_text() or "").replace("\n", " ") + " "
 
-    def from_text(label, std_key, prefer_pct=False):
+    def from_text(label, std_key):
         if std_key in labs or std_key in aux:
             return
         pat = re.compile(rf"(?i)\b{re.escape(label)}\b" + r".{0,120}?" + r"(-?\d+(?:\.\d+)?)")
@@ -373,7 +362,7 @@ def parse_pdf_labs(file_like) -> dict:
         if not m:
             return
         val = float(m.group(1))
-        window = full_text[max(0, m.start()-40): m.end()+40].lower()
+        window = full_text[max(0, m.start() - 40): m.end() + 40].lower()
 
         if std_key == "crp" and ("mg/dl" in window) and ("mg/l" not in window):
             val *= 10.0
@@ -387,11 +376,11 @@ def parse_pdf_labs(file_like) -> dict:
             labs[std_key] = val
             evidence[std_key] = (val, window.strip())
 
-    # Scan all synonyms in the free text
+    # scan all synonyms in free text
     for label, key in synonyms:
         from_text(label, key)
 
-    # --- Extra ALP fallbacks (catch odd labels like "ALP 82 U/L", "alk phos 90") ---
+    # --- Extra ALP fallbacks ---
     if "alp" not in labs:
         m = re.search(r"(?i)\bALP\b[^\n]{0,40}?(-?\d+(?:\.\d+)?)", full_text)
         if m:
@@ -399,79 +388,36 @@ def parse_pdf_labs(file_like) -> dict:
                 labs["alp"] = float(m.group(1))
 
     if "alp" not in labs:
-        # “alk ... phos ...” near a number on the same line
         m = re.search(r"(?i)alk[^\n]{0,80}?phos[^\n]{0,80}?(-?\d+(?:\.\d+)?)", full_text)
         if m:
             with contextlib.suppress(Exception):
                 labs["alp"] = float(m.group(1))
 
     if "alp" not in labs:
-        # “alkaline phosphatase/phosphate” + number
         m = re.search(r"(?i)(alk(?:aline)?\s+phosph(?:atase|ate))[^\n]{0,60}?(-?\d+(?:\.\d+)?)", full_text)
         if m:
             with contextlib.suppress(Exception):
                 labs["alp"] = float(m.group(2))
 
-    # Compute lymph % from absolute when needed and WBC present
+    # --- derive lymph % from absolute if needed (needs WBC; sanitize will rescale WBC if cells/µL) ---
     if "lymphs_pct" in aux and "lymphs" not in labs:
         labs["lymphs"] = aux["lymphs_pct"]
         evidence["lymphs"] = evidence.get("lymphs_pct", (labs["lymphs"], "% cell"))
 
     if ("lymphs" not in labs) and ("lymphs_abs" in aux) and ("wbc" in labs):
         try:
-            abs_cells = float(aux["lymphs_abs"])        # cells/µL
-            wbc_k    = float(labs["wbc"])              # may be 10^3/µL; sanitize will fix if not
+            abs_cells = float(aux["lymphs_abs"])   # cells/µL
+            wbc_k    = float(labs["wbc"])         # may still be cells/µL; fixed in sanitize_labs
             pct = (abs_cells / (wbc_k * 1000.0)) * 100.0
             labs["lymphs"] = pct
             evidence["lymphs"] = (pct, f"derived from abs {aux['lymphs_abs']} and wbc {labs['wbc']}")
         except Exception:
             pass
 
-    # Keep the last evidence snapshot for optional UI
+    # for optional UI debugging
     labs["_evidence"] = evidence
     return labs
 
-    # --- Extra ALP fallbacks (catches odd labels like "ALP 82 U/L") ---
-    if "alp" not in labs:
-        m = re.search(r"(?i)\bALP\b[^\n]{0,40}?(-?\d+(?:\.\d+)?)", full_text)
-        if m:
-            with contextlib.suppress(Exception):
-                labs["alp"] = float(m.group(1))
-
-if "alp" not in labs:
-    # "alk ... phos ..." near a number on the same line
-    m = re.search(r"(?i)alk[^\n]{0,80}?phos[^\n]{0,80}?(-?\d+(?:\.\d+)?)", full_text)
-    if m:
-        with contextlib.suppress(Exception):
-            labs["alp"] = float(m.group(1))
-
-if "alp" not in labs:
-    # "alkaline phosphatase/phosphate" + number
-    m = re.search(r"(?i)(alk(?:aline)?\s+phosph(?:atase|ate))[^\n]{0,60}?(-?\d+(?:\.\d+)?)", full_text)
-    if m:
-        with contextlib.suppress(Exception):
-            labs["alp"] = float(m.group(2))
-
-
-    # Compute lymph % from absolute when needed and WBC present
-    if "lymphs_pct" in aux and "lymphs" not in labs:
-        labs["lymphs"] = aux["lymphs_pct"]
-        evidence["lymphs"] = evidence.get("lymphs_pct", (labs["lymphs"], "% cell"))
-
-    if ("lymphs" not in labs) and ("lymphs_abs" in aux) and ("wbc" in labs):
-        try:
-            abs_cells = float(aux["lymphs_abs"])        # cells/µL
-            wbc_k    = float(labs["wbc"])              # might be 10^3/µL or cells/µL; sanitize will fix
-            # Leave as-is; sanitize_labs will correct if wbc is large (cells/µL)
-            pct = (abs_cells / (wbc_k * 1000.0)) * 100.0
-            labs["lymphs"] = pct
-            evidence["lymphs"] = (pct, f"derived from abs {aux['lymphs_abs']} and wbc {labs['wbc']}")
-        except Exception:
-            pass
-
-    # Keep the last evidence snapshot for optional UI
-    labs["_evidence"] = evidence
-    return labs
 
 
 def sanitize_labs(labs: dict) -> dict:
