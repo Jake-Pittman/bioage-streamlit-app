@@ -51,6 +51,8 @@ except Exception:
     HAS_PDFPLUMBER = False
 
 # =============================================================================
+st.cache_data.clear()
+
 # Small helpers
 # =============================================================================
 def robust_z(x: pd.Series) -> pd.Series:
