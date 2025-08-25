@@ -48,6 +48,48 @@ def robust_z(x: pd.Series) -> pd.Series:
 
 def clip01(v): return float(np.clip(v, 0.0, 1.0))
 
+# ---------------- PhenoAge (Levine) ----------------
+def phenoage_from_row(row: pd.Series):
+    """
+    Uses official coefficients + Gompertz mapping.
+    Inputs (clinical units): albumin g/dL, creat mg/dL, glucose mg/dL, CRP mg/L,
+    lymphocyte %, MCV fL, RDW %, ALP U/L, WBC 10^3/µL, age years
+    """
+    need = ["age_years","albumin","creatinine","glucose","crp_mgL",
+            "lymphocyte_pct","mcv","rdw","alk_phosphatase","wbc"]
+    if any(pd.isna(row.get(k)) for k in need):
+        return (None, None)
+
+    albumin_gL   = float(row["albumin"]) * 10.0
+    creat_umol   = float(row["creatinine"]) * 88.4
+    glucose_mmol = float(row["glucose"]) / 18.0
+    lncrp        = np.log(max(float(row["crp_mgL"]), 0.0) + 1e-6)
+    lymph        = float(row["lymphocyte_pct"])
+    mcv          = float(row["mcv"])
+    rdw          = float(row["rdw"])
+    alp          = float(row["alk_phosphatase"])
+    wbc          = float(row["wbc"])
+    age          = float(row["age_years"])
+
+    xb = (
+        -19.90667
+        + (-0.03359355 * albumin_gL)
+        + ( 0.009506491 * creat_umol)
+        + ( 0.1953192  * glucose_mmol)
+        + ( 0.09536762 * lncrp)
+        + (-0.01199984 * lymph)
+        + ( 0.02676401 * mcv)
+        + ( 0.3306156  * rdw)
+        + ( 0.001868778* alp)
+        + ( 0.05542406 * wbc)
+        + ( 0.08035356 * age)
+    )
+    m = 1.0 - np.exp( (-1.51714 * np.exp(xb)) / 0.007692696 )
+    m = float(np.clip(m, 1e-15, 1 - 1e-15))
+    pheno = (np.log(-0.0055305 * np.log(1.0 - m)) / 0.09165) + 141.50225
+    accel = pheno - age
+    return float(np.clip(pheno, 0.0, 140.0)), float(np.clip(accel, -60.0, 90.0))
+
 # ---------------- Loaders ----------------
 # ---------------- Loaders ----------------
 # ---------------- Loaders ----------------
@@ -182,9 +224,18 @@ def parse_pdf_labs(file_like) -> dict:
 
         ("alkaline phosphatase (total)", "alp"), ("alkaline phosphatase, total", "alp"),
         ("alkaline phosphatase (alp)", "alp"), ("alkaline phosphatase (alk phos)", "alp"),
+        ("alkaline phosphatase serum", "alp"),            # NEW
+        ("alkaline phosphatase total", "alp"),            # NEW
+        ("alkaline phosph", "alp"),                       # NEW (truncated label)
+        ("alk phosphate", "alp"),                         # NEW (common variant)
+        ("alk phosph", "alp"),                            # NEW (short variant)
         ("alk phosphatase", "alp"), ("alk. phosphatase", "alp"),
+        ("alk phos total", "alp"),                        # NEW
+        ("alk phos, total", "alp"),                       # NEW
         ("alk phos", "alp"), ("alk-phos", "alp"),
-        ("alkaline phosphatase", "alp"), ("alp", "alp"),
+        ("alkaline phosphatase", "alp"),
+        ("alp", "alp"),
+
 
         ("c-reactive protein, cardiac", "crp"), ("c-reactive protein (cardiac)", "crp"),
         ("c reactive protein, cardiac", "crp"), ("crp, cardiac", "crp"),
@@ -337,7 +388,28 @@ def parse_pdf_labs(file_like) -> dict:
             evidence[std_key] = (val, window.strip())
 
     for label, key in synonyms:
-        from_text(label, key)
+    from_text(label, key)
+    # --- Extra ALP fallbacks (catches odd labels like "ALP 82 U/L") ---
+    if "alp" not in labs:
+        m = re.search(r"(?i)\bALP\b[^\n]{0,40}?(-?\d+(?:\.\d+)?)", full_text)
+        if m:
+            with contextlib.suppress(Exception):
+                labs["alp"] = float(m.group(1))
+
+if "alp" not in labs:
+    # "alk ... phos ..." near a number on the same line
+    m = re.search(r"(?i)alk[^\n]{0,80}?phos[^\n]{0,80}?(-?\d+(?:\.\d+)?)", full_text)
+    if m:
+        with contextlib.suppress(Exception):
+            labs["alp"] = float(m.group(1))
+
+if "alp" not in labs:
+    # "alkaline phosphatase/phosphate" + number
+    m = re.search(r"(?i)(alk(?:aline)?\s+phosph(?:atase|ate))[^\n]{0,60}?(-?\d+(?:\.\d+)?)", full_text)
+    if m:
+        with contextlib.suppress(Exception):
+            labs["alp"] = float(m.group(2))
+
 
     # Compute lymph % from absolute when needed and WBC present
     if "lymphs_pct" in aux and "lymphs" not in labs:
@@ -650,15 +722,28 @@ if run_clicked:
         parsed_df = pd.DataFrame([mapped])
 
 # ---- Labs + BioAge metrics ----
-st.subheader("Parsed labs & BioAge")
-if parsed_df is not None:
+# -------- 2) Show normalized labs & BioAge --------
+st.subheader("2) Parsed labs & BioAge")
+
+def _have_all_needed_cols(df: pd.DataFrame) -> bool:
+    need = ["age_years","albumin","creatinine","glucose","crp_mgL",
+            "lymphocyte_pct","mcv","rdw","alk_phosphatase","wbc"]
+    return all(c in df.columns for c in need)
+
+if isinstance(parsed_df, pd.DataFrame) and not parsed_df.empty and _have_all_needed_cols(parsed_df):
+    st.caption("Parsed (normalized) labs used for scoring:")
     st.dataframe(parsed_df, use_container_width=True)
-    bio, accel = phenoage_from_row(parsed_df.iloc[0])
+
+    # ensure empty strings/None become NaN for the model check
+    safe_row = parsed_df.iloc[0].apply(lambda v: np.nan if v in (None, "") else v)
+    bio, accel = phenoage_from_row(safe_row)
+
     c1, c2 = st.columns(2)
     with c1: st.metric("BioAge (PhenoAge)", f"{bio:.1f}" if bio is not None else "–")
     with c2: st.metric("BioAgeAccel", f"{accel:+.1f}" if accel is not None else "–")
 else:
-    st.info("Upload a PDF/CSV, enter age, and press the button.")
+    st.info("Upload a PDF/CSV, enter age, then click the button to parse and compute BioAge.")
+
 
 # ---- Recommendations ----
 st.subheader("Food recommendations")
