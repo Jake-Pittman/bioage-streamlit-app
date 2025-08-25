@@ -380,15 +380,57 @@ def parse_pdf_labs(file_like) -> dict:
         if std_key == "albumin" and "g/l" in window:
             val /= 10.0
 
-        if std_key in ("lymphs_pct","lymphs_abs"):
+        if std_key in ("lymphs_pct", "lymphs_abs"):
             aux[std_key] = val
             evidence[std_key] = (val, window.strip())
         else:
             labs[std_key] = val
             evidence[std_key] = (val, window.strip())
 
-for label, key in synonyms:
-from_text(label, key)
+    # Scan all synonyms in the free text
+    for label, key in synonyms:
+        from_text(label, key)
+
+    # --- Extra ALP fallbacks (catch odd labels like "ALP 82 U/L", "alk phos 90") ---
+    if "alp" not in labs:
+        m = re.search(r"(?i)\bALP\b[^\n]{0,40}?(-?\d+(?:\.\d+)?)", full_text)
+        if m:
+            with contextlib.suppress(Exception):
+                labs["alp"] = float(m.group(1))
+
+    if "alp" not in labs:
+        # “alk ... phos ...” near a number on the same line
+        m = re.search(r"(?i)alk[^\n]{0,80}?phos[^\n]{0,80}?(-?\d+(?:\.\d+)?)", full_text)
+        if m:
+            with contextlib.suppress(Exception):
+                labs["alp"] = float(m.group(1))
+
+    if "alp" not in labs:
+        # “alkaline phosphatase/phosphate” + number
+        m = re.search(r"(?i)(alk(?:aline)?\s+phosph(?:atase|ate))[^\n]{0,60}?(-?\d+(?:\.\d+)?)", full_text)
+        if m:
+            with contextlib.suppress(Exception):
+                labs["alp"] = float(m.group(2))
+
+    # Compute lymph % from absolute when needed and WBC present
+    if "lymphs_pct" in aux and "lymphs" not in labs:
+        labs["lymphs"] = aux["lymphs_pct"]
+        evidence["lymphs"] = evidence.get("lymphs_pct", (labs["lymphs"], "% cell"))
+
+    if ("lymphs" not in labs) and ("lymphs_abs" in aux) and ("wbc" in labs):
+        try:
+            abs_cells = float(aux["lymphs_abs"])        # cells/µL
+            wbc_k    = float(labs["wbc"])              # may be 10^3/µL; sanitize will fix if not
+            pct = (abs_cells / (wbc_k * 1000.0)) * 100.0
+            labs["lymphs"] = pct
+            evidence["lymphs"] = (pct, f"derived from abs {aux['lymphs_abs']} and wbc {labs['wbc']}")
+        except Exception:
+            pass
+
+    # Keep the last evidence snapshot for optional UI
+    labs["_evidence"] = evidence
+    return labs
+
     # --- Extra ALP fallbacks (catches odd labels like "ALP 82 U/L") ---
     if "alp" not in labs:
         m = re.search(r"(?i)\bALP\b[^\n]{0,40}?(-?\d+(?:\.\d+)?)", full_text)
