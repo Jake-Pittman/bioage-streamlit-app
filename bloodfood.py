@@ -387,8 +387,8 @@ def parse_pdf_labs(file_like) -> dict:
             labs[std_key] = val
             evidence[std_key] = (val, window.strip())
 
-    for label, key in synonyms:
-    from_text(label, key)
+for label, key in synonyms:
+from_text(label, key)
     # --- Extra ALP fallbacks (catches odd labels like "ALP 82 U/L") ---
     if "alp" not in labs:
         m = re.search(r"(?i)\bALP\b[^\n]{0,40}?(-?\d+(?:\.\d+)?)", full_text)
