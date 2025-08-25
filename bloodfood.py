@@ -483,43 +483,62 @@ def compute_marker_severity(labs_row: pd.Series) -> dict:
 def load_perfood_bundle():
     """
     Load per-marker ML bundle from models/PerFood (or models/Perfood).
-    Returns dict or None.
+    Returns: {"dir", "meta", "features", "scaler", "models", "r2_map"} or None
     """
     mdl_dir = root / "models" / "PerFood"
     if not mdl_dir.exists():
         mdl_dir = root / "models" / "Perfood"
     if not mdl_dir.exists():
-        st.warning(f"PerFood models folder not found under {(root / 'models')}.")
+        st.warning(f"PerFood models folder not found under {root / 'models'}.")
         return None
 
+    # meta (optional)
     meta = {}
     meta_path = mdl_dir / "meta.json"
     if meta_path.exists():
         with contextlib.suppress(Exception):
             meta = json.load(open(meta_path))
 
+    # joblib dependency
     try:
         from joblib import load as joblib_load
     except Exception:
         st.error("Missing dependency 'joblib'. Add it to requirements.txt and redeploy.")
         return None
 
+    # scaler (optional)
     scaler = None
-    scaler_path = mdl_dir / "X_scaler.joblib"
-    if scaler_path.exists():
+    sp = mdl_dir / "X_scaler.joblib"
+    if sp.exists():
         with contextlib.suppress(Exception):
-            scaler = joblib_load(scaler_path)
+            scaler = joblib_load(sp)
 
+    # models
     models = {}
     for p in mdl_dir.glob("*.joblib"):
         if p.name == "X_scaler.joblib":
             continue
         with contextlib.suppress(Exception):
-            models[p.stem] = joblib_load(p)
+            # Normalize key (handles names like lgmb_LBXSGL.joblib)
+            models[p.stem.split(".")[0]] = joblib_load(p)
 
     if not models:
         st.error(f"No *.joblib models found in {mdl_dir}.")
         return None
+
+    # features (if provided in meta)
+    features = meta.get("features") or meta.get("feature_names")
+
+    # r2 map (optional)
+    r2_map = {}
+    r2p = mdl_dir / "per_target_r2.csv"
+    if r2p.exists():
+        with contextlib.suppress(Exception):
+            r2 = pd.read_csv(r2p)
+            if {"target","r2"}.issubset(r2.columns):
+                r2_map = {str(t): float(r) for t, r in zip(r2["target"], r2["r2"])}
+
+    return {"dir": str(mdl_dir), "meta": meta, "features": features, "scaler": scaler, "models": models, "r2_map": r2_map}
 
     # Feature names may live under different keys
     features = meta.get("features") or meta.get("feature_names")
