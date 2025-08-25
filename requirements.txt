@@ -5,4 +5,5 @@ joblib
 scikit-learn
 lightgbm
 pdfplumber
-pyarrow
+pyarrow>=14
+# (optional) fastparquet>=2024.2.0

@@ -58,31 +58,72 @@ def robust_z(x: pd.Series) -> pd.Series:
 def clip01(v): return float(np.clip(v, 0.0, 1.0))
 
 # ---------------- Loaders ----------------
+# ---------------- Loaders ----------------
 @st.cache_data(show_spinner=False)
 def load_catalog() -> pd.DataFrame:
     cat = pd.read_parquet(CAT_PARQUET)
     cat["FoodCode"] = pd.to_numeric(cat["FoodCode"], errors="coerce").astype("Int64")
-    if "tags" not in cat.columns: cat["tags"] = np.nan
+    if "tags" not in cat.columns:
+        cat["tags"] = np.nan
     return cat
 
-@st.cache_data(show_spinner=False)
-def load_fnd_features() -> pd.DataFrame | None:
-    """Return a DF with FoodCode + NUTR_* columns (per 100kcal preferred)."""
-    if not FND_PARQUET.exists():
-        # Try to use catalog if it already contains NUTR_* columns
-        if CAT_PARQUET.exists():
-            c = pd.read_parquet(CAT_PARQUET)
-            nutr_cols = [c for c in c.columns if str(c).startswith("NUTR_")]
-            if nutr_cols:
-                out = c[["FoodCode"] + nutr_cols].copy()
-                out["FoodCode"] = pd.to_numeric(out["FoodCode"], errors="coerce").astype("Int64")
-                return out
-        return None
+# Accept any sane FNDDS schema and return FoodCode + NUTR_* features
+NUTR_CODES = {
+    "KCAL","CARB","PROT","TFAT","SFAT","PFAT","MFAT","SUGR","FIBE","FDFE",
+    "CALC","PHOS","MAGN","POTA","SODI","ZINC","SELE","COPP",
+    "ATOC","VARA","VK","VC","VB1","VB2","VB6","VB12","NIAC","CAFF"
+}
 
-    fnd = pd.read_parquet(FND_PARQUET)
-    fnd["FoodCode"] = pd.to_numeric(fnd["FoodCode"], errors="coerce").astype("Int64")
-    nutr_cols = [c for c in fnd.columns if str(c).startswith("NUTR_")]
-    return fnd[["FoodCode"] + nutr_cols].copy()
+@st.cache_data(show_spinner=False)
+def load_food_nutr_matrix() -> pd.DataFrame | None:
+    """Return a DF with columns: FoodCode, NUTR_* (per-100g or per-100kcal)."""
+
+    def _normalize(df: pd.DataFrame) -> pd.DataFrame | None:
+        # Uppercase headers for easy matching
+        df = df.copy()
+        df.columns = [str(c).strip() for c in df.columns]
+        df = df.rename(columns={c: c.upper() for c in df.columns})
+
+        # Normalize FoodCode header
+        if "FOODCODE" in df.columns and "FoodCode" not in df.columns:
+            df = df.rename(columns={"FOODCODE": "FoodCode"})
+        if "FoodCode" not in df.columns:
+            return None
+        df["FoodCode"] = pd.to_numeric(df["FoodCode"], errors="coerce").astype("Int64")
+
+        # Add NUTR_ prefix if missing (e.g., KCAL → NUTR_KCAL)
+        ren = {}
+        for c in df.columns:
+            cu = c.upper()
+            base = cu[5:] if cu.startswith("NUTR_") else cu
+            if base in NUTR_CODES:
+                ren[c] = f"NUTR_{base}"
+        if ren:
+            df = df.rename(columns=ren)
+
+        nutr_cols = [c for c in df.columns if c.upper().startswith("NUTR_")]
+        return df[["FoodCode"] + nutr_cols] if nutr_cols else None
+
+    # 1) Preferred: processed/FNDDS_MASTER_PER100G.parquet
+    try:
+        if FND_PARQUET.exists():
+            out = _normalize(pd.read_parquet(FND_PARQUET))
+            if out is not None:
+                return out
+    except Exception as e:
+        st.warning(f"Couldn't read {FND_PARQUET.name}: {e}")
+
+    # 2) Fallback: use whatever nutrient columns are already in the catalog
+    try:
+        if CAT_PARQUET.exists():
+            out = _normalize(pd.read_parquet(CAT_PARQUET))
+            if out is not None:
+                return out
+    except Exception as e:
+        st.warning(f"Catalog nutrient fallback failed: {e}")
+
+    return None
+
 
 # ---------------- Dedup + categories used in UI ----------------
 _STOPWORDS = re.compile(
@@ -139,139 +180,283 @@ def dedup_rank(df: pd.DataFrame, include_tags: str = "", exclude_tags: str = "")
     return R.reset_index(drop=True)
 
 # ---------------- PDF → labs → sanitize → PhenoAge ----------------
-LAB_SCHEMA_FALLBACK = {
-    "age_years":{"unit":"years","aliases":["age","age_yrs"]},
-    "albumin":{"unit":"g/dL","aliases":["LBXSAL","albumin"]},
-    "creatinine":{"unit":"mg/dL","aliases":["LBXSCR","creatinine","creat"]},
-    "glucose":{"unit":"mg/dL","aliases":["LBXSGL","glucose"]},
-    "crp_mgL":{"unit":"mg/L","aliases":["CRP","hsCRP","hs-crp","LBXCRP"]},
-    "lymphocyte_pct":{"unit":"%","aliases":["lymphs","lymphocyte %","lymphocytes %"]},
-    "mcv":{"unit":"fL","aliases":["LBXMCVSI","mcv"]},
-    "rdw":{"unit":"%","aliases":["LBXRDW","rdw"]},
-    "alk_phosphatase":{"unit":"U/L","aliases":["LBXSAPSI","alk phos","alkaline phosphatase"]},
-    "wbc":{"unit":"10^3/µL","aliases":["LBXWBCSI","wbc","white blood cells"]},
-}
-
-@st.cache_data(show_spinner=False)
-def load_lab_schema():
-    js = ASSETS / "lab_schema.json"
-    if js.exists():
-        with open(js, "r") as f: return json.load(f)
-    return LAB_SCHEMA_FALLBACK
-
-def normalize_labs(df_in: pd.DataFrame, schema: dict) -> pd.DataFrame:
-    df = df_in.copy()
-    alias_map = {a.lower(): std for std, meta in schema.items() for a in meta.get("aliases", [])}
-    rename = {col: alias_map[col.lower()] for col in df.columns if col.lower() in alias_map}
-    if rename: df = df.rename(columns=rename)
-    keep = list(schema.keys())
-    cols_present = [c for c in keep if c in df.columns]
-    out = df[cols_present].copy()
-    for c in cols_present: out[c] = pd.to_numeric(out[c], errors="coerce")
-    return out
-
+# ---------------- Robust PDF parser + sanitizer ----------------
 def parse_pdf_labs(file_like) -> dict:
-    if not HAS_PDFPLUMBER: raise RuntimeError("pdfplumber not installed. Run: pip install pdfplumber")
-    expected_map = {
-        "albumin":"albumin", "serum albumin":"albumin", "albumin, serum":"albumin", "alb":"albumin",
-        "alkaline phosphatase":"alp","alk phos":"alp","alk. phos":"alp","alp":"alp",
-        "c-reactive protein":"crp","hs-crp":"crp","crp":"crp",
-        "glucose, fasting":"fasting_glucose","glucose (fasting)":"fasting_glucose","fasting glucose":"fasting_glucose","glucose":"fasting_glucose",
-        "wbc":"wbc","white blood cells":"wbc",
-        "absolute lymphocytes":"lymphs_abs","abs lymphocytes":"lymphs_abs",
-        "lymphocyte %":"lymphs_pct","lymphocytes %":"lymphs_pct","lymphocytes":"lymphs_pct","lymphs":"lymphs_pct",
-        "mcv":"mcv","rdw":"rdw",
-        "creatinine":"creatinine","creat":"creatinine","bun":"bun"
-    }
+    """
+    Returns a dict of raw extracted labs. Tries tables first, then text.
+    Handles ranges, units (mg/dL vs mg/L), and lymphocytes (# and %).
+    Keys returned when found (raw, before sanitize_labs):
+      albumin (g/dL)
+      creatinine (mg/dL)
+      fasting_glucose or glucose (mg/dL)
+      crp (mg/L or mg/dL handled later)
+      wbc (10^3/µL or cells/µL handled later)
+      lymphs (percent) or lymphs_abs (cells/µL)
+      mcv (fL)
+      rdw (%)
+      alp (U/L)
+    """
+    if not HAS_PDFPLUMBER:
+        raise RuntimeError("pdfplumber not installed. Run: pip install pdfplumber")
+
+    # ---- label synonyms (longest first match wins) ----
+    synonyms = [
+        # name, canonical_key
+        ("serum albumin", "albumin"), ("albumin, serum", "albumin"),
+        ("albumin (serum)", "albumin"), ("alb", "albumin"), ("albumin", "albumin"),
+
+        ("alkaline phosphatase (total)", "alp"), ("alkaline phosphatase, total", "alp"),
+        ("alkaline phosphatase (alp)", "alp"), ("alkaline phosphatase (alk phos)", "alp"),
+        ("alk phosphatase", "alp"), ("alk. phosphatase", "alp"),
+        ("alk phos", "alp"), ("alk-phos", "alp"),
+        ("alkaline phosphatase", "alp"), ("alp", "alp"),
+
+        ("c-reactive protein, cardiac", "crp"), ("c-reactive protein (cardiac)", "crp"),
+        ("c reactive protein, cardiac", "crp"), ("crp, cardiac", "crp"),
+        ("high sensitivity crp", "crp"), ("hs-crp", "crp"), ("hscrp", "crp"),
+        ("c-reactive protein", "crp"), ("c reactive protein", "crp"), ("crp", "crp"),
+
+        ("glucose, fasting", "fasting_glucose"), ("glucose (fasting)", "fasting_glucose"),
+        ("fasting glucose", "fasting_glucose"), ("glucose fasting", "fasting_glucose"),
+        ("glucose", "fasting_glucose"),
+
+        ("white blood cell count", "wbc"), ("white blood cells", "wbc"),
+        ("white blood cell", "wbc"), ("wbc", "wbc"),
+
+        ("lymphocytes absolute", "lymphs_abs"), ("absolute lymphocytes", "lymphs_abs"),
+        ("abs lymphocytes", "lymphs_abs"), ("lymphs #", "lymphs_abs"),
+        ("lymphocyte percent", "lymphs_pct"), ("lymphocytes percent", "lymphs_pct"),
+        ("lymphocyte %", "lymphs_pct"), ("lymphocytes %", "lymphs_pct"),
+        ("lymphocytes", "lymphs_pct"), ("lymphs", "lymphs_pct"),
+
+        ("mean corpuscular volume", "mcv"), ("mcv", "mcv"),
+        ("red cell distribution width", "rdw"), ("rdw", "rdw"),
+
+        ("creatinine", "creatinine"), ("creat", "creatinine"),
+        ("blood urea nitrogen", "bun"), ("bun", "bun"),
+    ]
+
+    # regex helpers
     range_pat  = re.compile(r"\b\d+(?:\.\d+)?\s*[-–]\s*\d+(?:\.\d+)?\b")
     number_pat = re.compile(r"(-?\d+(?:\.\d+)?)")
-    def first_number(text):
-        if not text or range_pat.search(text): return None
-        m = number_pat.search(text); return float(m.group(1)) if m else None
-    def match_key(lbl_raw):
-        s = (lbl_raw or "").strip().lower()
-        for syn, std in sorted(expected_map.items(), key=lambda kv: -len(kv[0])):
-            if syn in s: return std
+    percent_pat = re.compile(r"%")
+
+    def norm(s: str) -> str:
+        return (s or "").strip().lower()
+
+    def match_key(lbl: str) -> str | None:
+        s = norm(lbl)
+        for name, key in sorted(synonyms, key=lambda kv: -len(kv[0])):  # longest first
+            if name in s:
+                return key
         return None
-    labs, aux = {}, {}
+
+    def first_numeric(txt: str, prefer_percent=False):
+        """Return first numeric value if this cell is not a range; prefer cells containing '%' when asked."""
+        if not txt:
+            return None, None
+        if range_pat.search(txt):
+            return None, None
+        m = number_pat.search(txt)
+        if not m:
+            return None, None
+        val = float(m.group(1))
+        has_pct = bool(percent_pat.search(txt))
+        # tiny bias to prefer percent-labelled cells when we’re after lymphocyte%
+        score = (1 if (prefer_percent and has_pct) else 0, -len(txt))
+        return val, score
+
+    labs: dict = {}
+    aux: dict  = {}      # holds lymphs_abs, lymphs_pct if needed later
+    evidence = {}        # for optional debug in UI
+
+    # ---- Pass 1: tables ----
     with pdfplumber.open(file_like) as pdf:
         for page in pdf.pages:
-            for tbl in (page.extract_tables() or []):
-                for row in (tbl or []):
-                    if not row: continue
-                    key = match_key(row[0]);
-                    if not key: continue
-                    prefer_pct = (key == "lymphs_pct"); best = None
+            tables = page.extract_tables() or []
+            for tbl in tables:
+                for r_i, row in enumerate(tbl or []):
+                    if not row or all(c is None or str(c).strip()=="" for c in row):
+                        continue
+                    label = str(row[0] or "")
+                    key = match_key(label)
+                    if not key:
+                        continue
+
+                    prefer_pct = (key == "lymphs_pct")
+                    best = None   # (score, value, raw_text)
+
+                    # check cells to the right on the same row
                     for cell in row[1:]:
-                        txt = (cell or ""); val = first_number(txt)
-                        if val is None: continue
-                        cand = (1 if (prefer_pct and "%" in txt) else 0, -len(txt), val, txt)
-                        if (best is None) or (cand > best): best = cand
-                    if best is None: continue
-                    _, _, val, txt = best; lowtxt = (txt or "").lower()
-                    if key == "crp" and ("mg/dl" in lowtxt) and ("mg/l" not in lowtxt): val *= 10.0
-                    if key == "albumin" and "g/l" in lowtxt: val /= 10.0
-                    if key == "lymphs_abs": aux["lymphs_abs"] = val
-                    elif key == "lymphs_pct": labs["lymphs"] = val
-                    else: labs[key] = val
-    # Text fallback
-    file_like.seek(0); full = ""
+                        txt = str(cell or "")
+                        val, score = first_numeric(txt, prefer_percent=prefer_pct)
+                        if val is None:
+                            continue
+                        cand = (score, val, txt)
+                        if (best is None) or (cand > best):
+                            best = cand
+
+                    # if nothing on the same row, look one row below same column (common lab layout)
+                    if best is None and len(row) > 1 and r_i + 1 < len(tbl):
+                        below = str((tbl[r_i+1] or [""])[1] or "")
+                        val, score = first_numeric(below, prefer_percent=prefer_pct)
+                        if val is not None:
+                            best = ((score, val, below))
+
+                    if best is None:
+                        continue
+
+                    _, value, rawtxt = best
+                    lowtxt = rawtxt.lower()
+
+                    # Unit fixes at capture time
+                    if key == "crp" and ("mg/dl" in lowtxt) and ("mg/l" not in lowtxt):
+                        value *= 10.0
+                    if key == "albumin" and "g/l" in lowtxt:
+                        value /= 10.0
+
+                    if key == "lymphs_abs":
+                        aux["lymphs_abs"] = value
+                        evidence["lymphs_abs"] = (value, rawtxt)
+                    elif key == "lymphs_pct":
+                        aux["lymphs_pct"] = value
+                        evidence["lymphs_pct"] = (value, rawtxt)
+                    elif key == "wbc":
+                        # capture possible scale hints: "x10^3/uL", "10*3/uL", etc.
+                        if re.search(r"x\s*10\^?3\s*/?\s*u?l", lowtxt) or re.search(r"10\*?3", lowtxt):
+                            # this is already in 10^3/µL; we'll normalize later anyway
+                            pass
+                        labs["wbc"] = value
+                        evidence["wbc"] = (value, rawtxt)
+                    else:
+                        labs[key] = value
+                        evidence[key] = (value, rawtxt)
+
+    # ---- Pass 2: text fallback (simple label→value window search) ----
+    file_like.seek(0)
+    full_text = ""
     with pdfplumber.open(file_like) as pdf:
-        for p in pdf.pages: full += (p.extract_text() or "").replace("\n"," ") + " "
-    if "alp" not in labs:
-        m = re.search(r"(?i)alk[^\n]{0,80}?phos[^\n]{0,80}?(-?\d+(?:\.\d+)?)", full)
-        if m:
-            with contextlib.suppress(Exception): labs["alp"] = float(m.group(1))
-    if "lymphs" not in labs:
-        if aux.get("lymphs_pct") is not None: labs["lymphs"] = aux["lymphs_pct"]
-        elif aux.get("lymphs_abs") is not None and labs.get("wbc"):
-            labs["lymphs_abs"] = aux["lymphs_abs"]
+        for p in pdf.pages:
+            full_text += (p.extract_text() or "").replace("\n", " ") + " "
+
+    def from_text(label, std_key, prefer_pct=False):
+        if std_key in labs or std_key in aux:
+            return
+        pat = re.compile(rf"(?i)\b{re.escape(label)}\b" + r".{0,120}?" + r"(-?\d+(?:\.\d+)?)")
+        m = pat.search(full_text)
+        if not m:
+            return
+        val = float(m.group(1))
+        window = full_text[max(0, m.start()-40): m.end()+40].lower()
+
+        if std_key == "crp" and ("mg/dl" in window) and ("mg/l" not in window):
+            val *= 10.0
+        if std_key == "albumin" and "g/l" in window:
+            val /= 10.0
+
+        if std_key in ("lymphs_pct","lymphs_abs"):
+            aux[std_key] = val
+            evidence[std_key] = (val, window.strip())
+        else:
+            labs[std_key] = val
+            evidence[std_key] = (val, window.strip())
+
+    for label, key in synonyms:
+        from_text(label, key)
+
+    # Compute lymph % from absolute when needed and WBC present
+    if "lymphs_pct" in aux and "lymphs" not in labs:
+        labs["lymphs"] = aux["lymphs_pct"]
+        evidence["lymphs"] = evidence.get("lymphs_pct", (labs["lymphs"], "% cell"))
+
+    if ("lymphs" not in labs) and ("lymphs_abs" in aux) and ("wbc" in labs):
+        try:
+            abs_cells = float(aux["lymphs_abs"])        # cells/µL
+            wbc_k    = float(labs["wbc"])              # might be 10^3/µL or cells/µL; sanitize will fix
+            # Leave as-is; sanitize_labs will correct if wbc is large (cells/µL)
+            pct = (abs_cells / (wbc_k * 1000.0)) * 100.0
+            labs["lymphs"] = pct
+            evidence["lymphs"] = (pct, f"derived from abs {aux['lymphs_abs']} and wbc {labs['wbc']}")
+        except Exception:
+            pass
+
+    # Keep the last evidence snapshot for optional UI
+    labs["_evidence"] = evidence
     return labs
 
-def sanitize_labs(labs: dict) -> dict:
-    x = dict(labs) if labs else {}
-    if "wbc" in x and x["wbc"] is not None:
-        with contextlib.suppress(Exception):
-            w = float(x["wbc"]); x["wbc"] = w/1000.0 if w>100 else w
-    if x.get("lymphs_abs") not in (None, np.nan) and x.get("wbc") not in (None, 0, np.nan):
-        with contextlib.suppress(Exception):
-            abs_cells = float(x["lymphs_abs"]); wbc_k = float(x["wbc"])
-            x["lymphs"] = (abs_cells / (wbc_k*1000.0)) * 100.0
-    if x.get("lymphs") not in (None, np.nan):
-        with contextlib.suppress(Exception):
-            l = float(x["lymphs"])
-            if l > 1000 and x.get("wbc"):
-                l = (l / (float(x["wbc"])*1000.0))*100.0
-            if l > 100: l = l/10.0 if l<=300 else l/100.0
-            x["lymphs"] = float(np.clip(l, 1.0, 80.0))
-    if x.get("crp") not in (None, np.nan):
-        with contextlib.suppress(Exception):
-            c = float(x["crp"]);
-            if c > 200: c *= 10.0
-            x["crp"] = float(np.clip(c, 0.0, 500.0))
-    def _clip(k, lo, hi):
-        if x.get(k) not in (None, np.nan):
-            with contextlib.suppress(Exception): x[k] = float(np.clip(float(x[k]), lo, hi))
-    _clip("albumin", 2.0, 6.5); _clip("glucose", 40.0, 500.0); _clip("creatinine", 0.2, 12.0)
-    _clip("alp", 10.0, 1500.0); _clip("mcv", 60.0, 130.0); _clip("rdw", 8.0, 30.0); _clip("wbc", 0.1, 50.0)
-    return x
 
-def phenoage_from_row(row: pd.Series):
-    need = ["age_years","albumin","creatinine","glucose","crp_mgL","lymphocyte_pct","mcv","rdw","alk_phosphatase","wbc"]
-    if any(pd.isna(row.get(k)) for k in need): return (None, None)
-    albumin_gL   = float(row["albumin"])*10.0
-    creat_umol   = float(row["creatinine"])*88.4
-    glucose_mmol = float(row["glucose"])/18.0
-    lncrp        = np.log(max(float(row["crp_mgL"]),0.0)+1e-6)
-    lymph        = float(row["lymphocyte_pct"])
-    mcv          = float(row["mcv"]); rdw = float(row["rdw"])
-    alp          = float(row["alk_phosphatase"]); wbc = float(row["wbc"]); age = float(row["age_years"])
-    xb = (-19.90667 + (-0.03359355*albumin_gL) + (0.009506491*creat_umol) + (0.1953192*glucose_mmol)
-          + (0.09536762*lncrp) + (-0.01199984*lymph) + (0.02676401*mcv) + (0.3306156*rdw)
-          + (0.001868778*alp) + (0.05542406*wbc) + (0.08035356*age))
-    m = 1.0 - np.exp((-1.51714*np.exp(xb))/0.007692696); m = float(np.clip(m, 1e-15, 1-1e-15))
-    pheno = (np.log(-0.0055305*np.log(1.0 - m))/0.09165) + 141.50225; accel = pheno - age
-    return float(np.clip(pheno,0.0,140.0)), float(np.clip(accel,-60.0,90.0))
+def sanitize_labs(labs: dict) -> dict:
+    """
+    Normalize units and clamp to plausible ranges.
+    - WBC: cells/µL → 10^3/µL if needed
+    - Lymphocytes: fix absolute vs percent confusion; clamp 1–80%
+    - CRP: assume mg/L; if extreme, treat as mg/dL*10
+    """
+    x = dict(labs) if labs else {}
+
+    # WBC normalization
+    if "wbc" in x and x["wbc"] is not None:
+        try:
+            w = float(x["wbc"])
+            # If large, it's almost certainly cells/µL (e.g., 5400) → convert to 10^3/µL (5.4)
+            if w > 100:
+                w = w / 1000.0
+            x["wbc"] = float(np.clip(w, 0.1, 50.0))
+        except Exception:
+            pass
+
+    # Lymphocytes normalization
+    # a) compute % from abs if needed (requires wbc already normalized)
+    if x.get("lymphs") is None and x.get("lymphs_abs") is not None and x.get("wbc") not in (None, 0):
+        try:
+            abs_cells = float(x["lymphs_abs"])
+            wbc_k     = float(x["wbc"])
+            pct = (abs_cells / (wbc_k * 1000.0)) * 100.0
+            x["lymphs"] = pct
+        except Exception:
+            pass
+
+    # b) fix when a percent looks like absolute or is off by ×10 or ×100
+    if x.get("lymphs") is not None:
+        try:
+            l = float(x["lymphs"])
+            if l > 1000 and x.get("wbc"):  # absolute mistaken as percent
+                l = (l / (float(x["wbc"]) * 1000.0)) * 100.0
+            if l > 100:                     # e.g., 175.3 → 17.53
+                l = l / 10.0 if l <= 300 else l / 100.0
+            x["lymphs"] = float(np.clip(l, 1.0, 80.0))
+        except Exception:
+            pass
+
+    # CRP normalization to mg/L
+    if x.get("crp") is not None:
+        try:
+            c = float(x["crp"])
+            # if someone reported mg/dL and we missed it, values like 0.3 mg/dL → 3 mg/L
+            if 0 < c < 2 and ("_evidence" in x) and isinstance(x["_evidence"], dict):
+                # leave small values alone unless evidence said mg/dL; handled in parser
+                pass
+            if c > 200:  # crazy large values → probably mg/dL; convert
+                c = c * 10.0
+            x["crp"] = float(np.clip(c, 0.0, 500.0))
+        except Exception:
+            pass
+
+    # Clip typical ranges (prevents model blow-ups)
+    def _clip(k, lo, hi):
+        if x.get(k) is None:
+            return
+        with contextlib.suppress(Exception):
+            x[k] = float(np.clip(float(x[k]), lo, hi))
+
+    _clip("albumin", 2.0, 6.5)       # g/dL
+    _clip("glucose", 40.0, 500.0)    # mg/dL (fasting or random — handled same)
+    _clip("creatinine", 0.2, 12.0)   # mg/dL
+    _clip("alp", 10.0, 1500.0)       # U/L
+    _clip("mcv", 60.0, 130.0)        # fL
+    _clip("rdw", 8.0, 30.0)          # %
+    # wbc already clipped
+    return x
 
 # ---------------- Marker map & severity ----------------
 MARKER_MAP = {
