@@ -59,6 +59,26 @@ def clip01(v): return float(np.clip(v, 0.0, 1.0))
 
 # ---------------- Loaders ----------------
 # ---------------- Loaders ----------------
+# ---------------- Loaders ----------------
+@st.cache_data(show_spinner=False)
+def load_lab_schema():
+    if LAB_SCHEMA_JS.exists():
+        with open(LAB_SCHEMA_JS, "r") as f:
+            return json.load(f)
+    # minimal fallback schema
+    return {
+        "age_years":{"unit":"years","aliases":["age","age_yrs"]},
+        "albumin":{"unit":"g/dL","aliases":["LBXSAL","albumin"]},
+        "creatinine":{"unit":"mg/dL","aliases":["LBXSCR","creatinine","creat"]},
+        "glucose":{"unit":"mg/dL","aliases":["LBXSGL","glucose"]},
+        "crp_mgL":{"unit":"mg/L","aliases":["CRP","hsCRP","hs-crp","LBXCRP"]},
+        "lymphocyte_pct":{"unit":"%","aliases":["lymphs","lymphocyte %","lymphocytes %"]},
+        "mcv":{"unit":"fL","aliases":["LBXMCVSI","mcv"]},
+        "rdw":{"unit":"%","aliases":["LBXRDW","rdw"]},
+        "alk_phosphatase":{"unit":"U/L","aliases":["LBXSAPSI","alk phos","alkaline phosphatase"]},
+        "wbc":{"unit":"10^3/µL","aliases":["LBXWBCSI","wbc","white blood cells"]},
+    }
+
 @st.cache_data(show_spinner=False)
 def load_catalog() -> pd.DataFrame:
     cat = pd.read_parquet(CAT_PARQUET)
@@ -67,62 +87,24 @@ def load_catalog() -> pd.DataFrame:
         cat["tags"] = np.nan
     return cat
 
-# Accept any sane FNDDS schema and return FoodCode + NUTR_* features
-NUTR_CODES = {
-    "KCAL","CARB","PROT","TFAT","SFAT","PFAT","MFAT","SUGR","FIBE","FDFE",
-    "CALC","PHOS","MAGN","POTA","SODI","ZINC","SELE","COPP",
-    "ATOC","VARA","VK","VC","VB1","VB2","VB6","VB12","NIAC","CAFF"
-}
-
 @st.cache_data(show_spinner=False)
-def load_food_nutr_matrix() -> pd.DataFrame | None:
-    """Return a DF with columns: FoodCode, NUTR_* (per-100g or per-100kcal)."""
-
-    def _normalize(df: pd.DataFrame) -> pd.DataFrame | None:
-        # Uppercase headers for easy matching
-        df = df.copy()
-        df.columns = [str(c).strip() for c in df.columns]
-        df = df.rename(columns={c: c.upper() for c in df.columns})
-
-        # Normalize FoodCode header
-        if "FOODCODE" in df.columns and "FoodCode" not in df.columns:
-            df = df.rename(columns={"FOODCODE": "FoodCode"})
-        if "FoodCode" not in df.columns:
-            return None
-        df["FoodCode"] = pd.to_numeric(df["FoodCode"], errors="coerce").astype("Int64")
-
-        # Add NUTR_ prefix if missing (e.g., KCAL → NUTR_KCAL)
-        ren = {}
-        for c in df.columns:
-            cu = c.upper()
-            base = cu[5:] if cu.startswith("NUTR_") else cu
-            if base in NUTR_CODES:
-                ren[c] = f"NUTR_{base}"
-        if ren:
-            df = df.rename(columns=ren)
-
-        nutr_cols = [c for c in df.columns if c.upper().startswith("NUTR_")]
-        return df[["FoodCode"] + nutr_cols] if nutr_cols else None
-
-    # 1) Preferred: processed/FNDDS_MASTER_PER100G.parquet
-    try:
-        if FND_PARQUET.exists():
-            out = _normalize(pd.read_parquet(FND_PARQUET))
-            if out is not None:
-                return out
-    except Exception as e:
-        st.warning(f"Couldn't read {FND_PARQUET.name}: {e}")
-
-    # 2) Fallback: use whatever nutrient columns are already in the catalog
-    try:
-        if CAT_PARQUET.exists():
-            out = _normalize(pd.read_parquet(CAT_PARQUET))
-            if out is not None:
-                return out
-    except Exception as e:
-        st.warning(f"Catalog nutrient fallback failed: {e}")
-
+def load_fnd_features() -> pd.DataFrame | None:
+    """Return FoodCode + NUTR_* (prefer per-100kcal parquet)."""
+    if FND_PARQUET.exists():
+        fnd = pd.read_parquet(FND_PARQUET)
+        fnd["FoodCode"] = pd.to_numeric(fnd["FoodCode"], errors="coerce").astype("Int64")
+        nutr_cols = [c for c in fnd.columns if str(c).startswith("NUTR_")]
+        return fnd[["FoodCode"] + nutr_cols].copy() if nutr_cols else None
+    # fallback: if catalog already contains NUTR_* columns
+    if CAT_PARQUET.exists():
+        c = pd.read_parquet(CAT_PARQUET)
+        nutr_cols = [c for c in c.columns if str(c).startswith("NUTR_")]
+        if nutr_cols:
+            out = c[["FoodCode"] + nutr_cols].copy()
+            out["FoodCode"] = pd.to_numeric(out["FoodCode"], errors="coerce").astype("Int64")
+            return out
     return None
+
 
 
 # ---------------- Dedup + categories used in UI ----------------
@@ -639,7 +621,8 @@ with st.sidebar:
 
 schema   = load_lab_schema()
 catalog  = load_catalog() if CAT_PARQUET.exists() else None
-fnd_feats= load_fnd_features()
+fnd_nutr = load_fnd_features()  # you’ll pass this into your recommender
+
 
 parsed_df = None
 if run_clicked:
