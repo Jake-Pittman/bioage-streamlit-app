@@ -549,36 +549,31 @@ def load_perfood_bundle():
     Load the per-marker ML bundle from models/PerFood (or models/Perfood).
     Returns: {"dir": str, "meta": dict, "scaler": object|None, "models": dict[str, object]} or None
     """
-    # Resolve model directory without using undefined globals
     mdl_dir = root / "models" / "PerFood"
     if not mdl_dir.exists():
         mdl_dir = root / "models" / "Perfood"
     if not mdl_dir.exists():
-        st.warning(f"PerFood models folder not found under {root / 'models'}.")
+        st.warning(f"PerFood models folder not found under {(root / 'models')}.")
         return None
 
-    # meta (optional)
     meta = {}
     meta_path = mdl_dir / "meta.json"
     if meta_path.exists():
         with contextlib.suppress(Exception):
             meta = json.load(open(meta_path))
 
-    # joblib dependency
     try:
         from joblib import load as joblib_load
     except Exception:
         st.error("Missing dependency 'joblib'. Add it to requirements.txt and redeploy.")
         return None
 
-    # scaler (optional)
     scaler = None
     scaler_path = mdl_dir / "X_scaler.joblib"
     if scaler_path.exists():
         with contextlib.suppress(Exception):
             scaler = joblib_load(scaler_path)
 
-    # lightgbm models
     models = {}
     for p in mdl_dir.glob("*.joblib"):
         if p.name == "X_scaler.joblib":
@@ -588,27 +583,6 @@ def load_perfood_bundle():
 
     if not models:
         st.error(f"No *.joblib models found in {mdl_dir}.")
-        return None
-
-    return {"dir": str(mdl_dir), "meta": meta, "scaler": scaler, "models": models}
-
-
-
-    scal_path = mdl_dir / PERFOOD_SCALER
-    if scal_path.exists():
-        with contextlib.suppress(Exception):
-            scaler = joblib_load(scal_path)
-
-    # models: load all *.joblib except the scaler
-    models = {}
-    for p in mdl_dir.glob("*.joblib"):
-        if p.name == PERFOOD_SCALER:
-            continue
-        with contextlib.suppress(Exception):
-            models[p.stem] = joblib_load(p)
-
-    if not models:
-        # Nothing usable found
         return None
 
     return {"dir": str(mdl_dir), "meta": meta, "scaler": scaler, "models": models}
@@ -788,7 +762,7 @@ else:
                    "Ensure models/PerFood (or models/Perfood) contains meta.json, X_scaler.joblib, and *.joblib models.")
     else:
         req_feats = bundle.get("features")
-        X = build_feature_matrix(R_all, fnd_feats, req_feats)
+        X = build_feature_matrix(R_all, fnd_nutr, req_feats)
         if X is None:
             st.warning("Could not build NUTR_* feature matrix for foods. Ensure FNDDS parquet (processed/FNDDS_MASTER_PER100G.parquet) or catalog has NUTR_* columns.")
         else:
