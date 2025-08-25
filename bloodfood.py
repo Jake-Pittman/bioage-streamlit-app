@@ -10,6 +10,16 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+
+# Sanity marker so we can see which build is running
+APP_BUILD = "bf-v2-loader"
+st.sidebar.caption(f"Build: {APP_BUILD}")
+
+# If these show up, you still have old code; this helps catch it
+for _name in ("PERFOOD_DIR", "PERFOOD_ALT"):
+    if _name in globals():
+        st.sidebar.warning(f"Remove legacy global: {_name}")
+
 # =============================================================================
 # Page + Paths
 # =============================================================================
@@ -479,66 +489,80 @@ def compute_marker_severity(labs_row: pd.Series) -> dict:
 # =============================================================================
 # Per-food predictor
 # =============================================================================
-@st.cache_data(show_spinner=False)
-def load_perfood_bundle():
+# --- NEW: v2 loader; ignores old globals like PERFOOD_DIR/PERFOOD_ALT ---
+@st.cache_resource(show_spinner=False)
+def load_perfood_bundle_v2(models_root: Path):
     """
     Load per-marker ML bundle from models/PerFood (or models/Perfood).
-    Returns: {"dir", "meta", "features", "scaler", "models", "r2_map"} or None
+    Returns: {"dir","meta","features","scaler","models","r2_map"} or None
     """
-    mdl_dir = root / "models" / "PerFood"
+    # Resolve directory (case-insensitive fallback)
+    mdl_dir = models_root / "PerFood"
     if not mdl_dir.exists():
-        mdl_dir = root / "models" / "Perfood"
+        mdl_dir = models_root / "Perfood"
     if not mdl_dir.exists():
-        st.warning(f"PerFood models folder not found under {root / 'models'}.")
+        st.warning(f"PerFood models folder not found under {models_root}.")
         return None
 
-    # meta (optional)
+    # Show where we loaded from (helps verify the running code)
+    try:
+        st.sidebar.caption(f"PerFood models: {mdl_dir}")
+    except Exception:
+        pass
+
+    # Optional: meta (feature list, etc.)
     meta = {}
     meta_path = mdl_dir / "meta.json"
     if meta_path.exists():
         with contextlib.suppress(Exception):
             meta = json.load(open(meta_path))
 
-    # joblib dependency
+    # joblib (local import so we don’t fail module import)
     try:
         from joblib import load as joblib_load
     except Exception:
         st.error("Missing dependency 'joblib'. Add it to requirements.txt and redeploy.")
         return None
 
-    # scaler (optional)
+    # Optional scaler
     scaler = None
     sp = mdl_dir / "X_scaler.joblib"
     if sp.exists():
         with contextlib.suppress(Exception):
             scaler = joblib_load(sp)
 
-    # models
+    # Load all *.joblib models except the scaler
     models = {}
     for p in mdl_dir.glob("*.joblib"):
         if p.name == "X_scaler.joblib":
             continue
         with contextlib.suppress(Exception):
-            # Normalize key (handles names like lgmb_LBXSGL.joblib)
             models[p.stem.split(".")[0]] = joblib_load(p)
 
     if not models:
         st.error(f"No *.joblib models found in {mdl_dir}.")
         return None
 
-    # features (if provided in meta)
+    # Features (if provided)
     features = meta.get("features") or meta.get("feature_names")
 
-    # r2 map (optional)
+    # Optional R² map
     r2_map = {}
     r2p = mdl_dir / "per_target_r2.csv"
     if r2p.exists():
         with contextlib.suppress(Exception):
             r2 = pd.read_csv(r2p)
-            if {"target","r2"}.issubset(r2.columns):
+            if {"target", "r2"}.issubset(r2.columns):
                 r2_map = {str(t): float(r) for t, r in zip(r2["target"], r2["r2"])}
 
-    return {"dir": str(mdl_dir), "meta": meta, "features": features, "scaler": scaler, "models": models, "r2_map": r2_map}
+    return {
+        "dir": str(mdl_dir),
+        "meta": meta,
+        "features": features,
+        "scaler": scaler,
+        "models": models,
+        "r2_map": r2_map,
+    }
 
     # Feature names may live under different keys
     features = meta.get("features") or meta.get("feature_names")
@@ -721,7 +745,8 @@ else:
 
     # 3) per-food predictions
     P = None
-    bundle = load_perfood_bundle()
+    bundle = load_perfood_bundle_v2(root / "models")
+
     if bundle is None:
         st.warning("Per-marker ML bundle not found. Skipping per-marker recommendations.")
     else:
