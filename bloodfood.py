@@ -27,6 +27,13 @@ CONSENSUS_CSV  = CORE / "consensus_food_scores.csv"
 GUARDRAILS_CSV = CORE / "core_food_scores_guardrails.csv"
 ATTR_CSV       = CORE / "core_food_attribution_top50_compact.csv"  # optional
 
+# Per-marker ML bundle (case-insensitive fallback for mac→linux)
+PERFOOD_DIR = root / "models" / "PerFood"   # canonical
+PERFOOD_ALT = root / "models" / "Perfood"   # common Mac casing
+
+# File names expected inside the folder
+PERFOOD_META   = "meta.json"
+PERFOOD_SCALER = "X_scaler.joblib"
 
 # ---------------- Optional dependency: pdfplumber ----------------
 try:
@@ -529,56 +536,66 @@ def compute_marker_severity(labs_row: pd.Series) -> dict:
     return out
 
 # ---------------- Per-food predictor ----------------
-@st.cache_resource(show_spinner=False)
+@st.cache_data(show_spinner=False)
 def load_perfood_bundle():
-    """Locate models, scaler, r2, meta; return dict or None if unavailable."""
-    # pick a directory that exists
-    mdl_dir = PERFOOD_DIR if PERFOOD_DIR.exists() else (PERFOOD_ALT if PERFOOD_ALT.exists() else None)
+    """
+    Loads the per-food/per-marker ML bundle:
+      - meta.json
+      - X_scaler.joblib
+      - one or more *.joblib models (per-target)
+    Returns dict or None if not found:
+      {
+        "dir": str(Path),
+        "meta": dict,
+        "scaler": sklearn transformer or None,
+        "models": {model_name: estimator}
+      }
+    """
+    # choose the first folder that exists
+    mdl_dir = None
+    for cand in (PERFOOD_DIR, PERFOOD_ALT):
+        if cand.exists():
+            mdl_dir = cand
+            break
     if mdl_dir is None:
-        # also allow repo root (user sometimes drops joblibs at root)
-        if (root / SCALER_FILE).exists(): mdl_dir = root
-        else: return None
+        return None
 
-    bundle = {"dir": mdl_dir}
-    # scaler
-    sc_path = mdl_dir / SCALER_FILE
-    if not sc_path.exists(): return None
-    bundle["scaler"] = joblib_load(sc_path)
-
-    # per-target r2 (optional, but recommended)
-    r2_path = mdl_dir / R2_FILE
-    if r2_path.exists():
-        r2 = pd.read_csv(r2_path)
-        if {"target","r2"}.issubset(r2.columns):
-            bundle["r2_map"] = {str(t).strip(): float(r) for t, r in zip(r2["target"], r2["r2"])}
-        else:
-            bundle["r2_map"] = {}
-    else:
-        bundle["r2_map"] = {}
-
-    # meta.json for feature list (optional)
-    meta_path = mdl_dir / META_FILE
-    feats = None
+    # meta
+    meta = {}
+    meta_path = mdl_dir / PERFOOD_META
     if meta_path.exists():
-        with open(meta_path, "r") as f:
-            meta = json.load(f)
-            for k in ["feature_names","X_cols","features"]:
-                if k in meta and isinstance(meta[k], list):
-                    feats = [str(c) for c in meta[k]]
-                    break
-    bundle["features"] = feats
-
-    # load all model joblibs that match lgbm_*.joblib
-    models = {}
-    for p in sorted(glob.glob(str(mdl_dir / "lgbm_*.joblib"))):
-        name = Path(p).stem  # e.g., lgbm_LBXSGL
-        tgt = name.split("lgbm_")[-1]
         try:
-            models[tgt] = joblib_load(p)
+            with open(meta_path, "r") as f:
+                meta = json.load(f)
         except Exception:
+            pass
+
+    # scaler
+    scaler = None
+    try:
+        from joblib import load as joblib_load
+    except Exception as e:
+        st.error("The 'joblib' package is required for loading per-marker models. Add 'joblib' to requirements.txt.")
+        return None
+
+    scal_path = mdl_dir / PERFOOD_SCALER
+    if scal_path.exists():
+        with contextlib.suppress(Exception):
+            scaler = joblib_load(scal_path)
+
+    # models: load all *.joblib except the scaler
+    models = {}
+    for p in mdl_dir.glob("*.joblib"):
+        if p.name == PERFOOD_SCALER:
             continue
-    bundle["models"] = models
-    return bundle
+        with contextlib.suppress(Exception):
+            models[p.stem] = joblib_load(p)
+
+    if not models:
+        # Nothing usable found
+        return None
+
+    return {"dir": str(mdl_dir), "meta": meta, "scaler": scaler, "models": models}
 
 def build_feature_matrix(food_df: pd.DataFrame, fnd_df: pd.DataFrame | None, required: list[str] | None) -> pd.DataFrame | None:
     """
@@ -750,9 +767,9 @@ else:
 
     # 3) Per-food predictions (if models available)
     bundle = load_perfood_bundle()
-    P = None
     if bundle is None:
-        st.warning("Per-food ML models not found. Showing BioAge-only ranking. Place joblibs + scaler under models/PerFood/.")
+        st.warning("Per-marker ML bundle not found. Skipping per-marker recommendations. "
+                   "Ensure models/PerFood (or models/Perfood) contains meta.json, X_scaler.joblib, and *.joblib models.")
     else:
         req_feats = bundle.get("features")
         X = build_feature_matrix(R_all, fnd_feats, req_feats)
