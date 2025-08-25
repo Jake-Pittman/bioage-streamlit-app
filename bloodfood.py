@@ -3,24 +3,21 @@
 # - Loads per-food LightGBM models (joblib) + scaler → predicts marker deltas per food
 # - Blends BioAge score with per-marker impact + dietary preferences
 
-# ---- imports (keep yours) ----
+from __future__ import annotations
 import os, re, io, json, contextlib
 from pathlib import Path
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-# ---------------- Paths (MUST be defined before loaders) ----------------
-# ---------------- Paths ----------------
+# =============================================================================
+# Page + Paths
+# =============================================================================
+st.set_page_config(page_title="Blood→Food: BioAge + Marker Recs", layout="wide")
+
 REPO_ROOT = Path(__file__).resolve().parent
 env_root  = os.environ.get("BIOAGE_ROOT")
 root      = Path(env_root) if env_root else REPO_ROOT
-
-# ADD THESE 3 LINES ↓
-MODELS_DIR   = root / "models"
-PERFOOD_DIR  = MODELS_DIR / "PerFood"
-PERFOOD_ALT  = MODELS_DIR / "Perfood"
-
 
 PROC   = root / "processed"
 ASSETS = root / "app_assets"
@@ -34,24 +31,19 @@ CONSENSUS_CSV  = CORE / "consensus_food_scores.csv"
 GUARDRAILS_CSV = CORE / "core_food_scores_guardrails.csv"
 ATTR_CSV       = CORE / "core_food_attribution_top50_compact.csv"  # optional
 
-# Per-marker ML bundle (case-insensitive fallback for mac→linux)
-PERFOOD_DIR = root / "models" / "PerFood"   # canonical
-PERFOOD_ALT = root / "models" / "Perfood"   # common Mac casing
-
-# File names expected inside the folder
-PERFOOD_META   = "meta.json"
-PERFOOD_SCALER = "X_scaler.joblib"
-
-# ---------------- Optional dependency: pdfplumber ----------------
+# =============================================================================
+# Optional dependency: pdfplumber
+# =============================================================================
 try:
     import pdfplumber
     HAS_PDFPLUMBER = True
 except Exception:
     HAS_PDFPLUMBER = False
 
-# ---------------- Small helpers ----------------
+# =============================================================================
+# Small helpers
+# =============================================================================
 def robust_z(x: pd.Series) -> pd.Series:
-    """Robust z-score using median & IQR; falls back to std if needed."""
     x = pd.to_numeric(x, errors="coerce").astype(float)
     med = np.nanmedian(x)
     iqr = np.nanpercentile(x, 75) - np.nanpercentile(x, 25)
@@ -62,10 +54,72 @@ def robust_z(x: pd.Series) -> pd.Series:
 
 def clip01(v): return float(np.clip(v, 0.0, 1.0))
 
-# ---------------- PhenoAge (Levine) ----------------
+# =============================================================================
+# Loaders
+# =============================================================================
+@st.cache_data(show_spinner=False)
+def load_lab_schema() -> dict:
+    if LAB_SCHEMA_JS.exists():
+        with open(LAB_SCHEMA_JS, "r") as f:
+            return json.load(f)
+    # minimal fallback schema (units for display/CSV aliasing)
+    return {
+        "age_years":{"unit":"years","aliases":["age","age_yrs"]},
+        "albumin":{"unit":"g/dL","aliases":["LBXSAL","albumin"]},
+        "creatinine":{"unit":"mg/dL","aliases":["LBXSCR","creatinine","creat"]},
+        "glucose":{"unit":"mg/dL","aliases":["LBXSGL","glucose"]},
+        "crp_mgL":{"unit":"mg/L","aliases":["CRP","hsCRP","hs-crp","LBXCRP"]},
+        "lymphocyte_pct":{"unit":"%","aliases":["lymphs","lymphocyte %","lymphocytes %"]},
+        "mcv":{"unit":"fL","aliases":["LBXMCVSI","mcv"]},
+        "rdw":{"unit":"%","aliases":["LBXRDW","rdw"]},
+        "alk_phosphatase":{"unit":"U/L","aliases":["LBXSAPSI","alk phos","alkaline phosphatase"]},
+        "wbc":{"unit":"10^3/µL","aliases":["LBXWBCSI","wbc","white blood cells"]},
+    }
+
+@st.cache_data(show_spinner=False)
+def load_catalog() -> pd.DataFrame | None:
+    if not CAT_PARQUET.exists():
+        return None
+    cat = pd.read_parquet(CAT_PARQUET)
+    cat["FoodCode"] = pd.to_numeric(cat["FoodCode"], errors="coerce").astype("Int64")
+    if "tags" not in cat.columns:
+        cat["tags"] = np.nan
+    return cat
+
+@st.cache_data(show_spinner=False)
+def load_fnd_features() -> pd.DataFrame | None:
+    """Return FoodCode + NUTR_* features (prefer processed/FNDDS parquet)."""
+    if FND_PARQUET.exists():
+        fnd = pd.read_parquet(FND_PARQUET)
+        fnd["FoodCode"] = pd.to_numeric(fnd["FoodCode"], errors="coerce").astype("Int64")
+        nutr_cols = [c for c in fnd.columns if str(c).startswith("NUTR_")]
+        return fnd[["FoodCode"] + nutr_cols].copy() if nutr_cols else None
+    if CAT_PARQUET.exists():
+        c = pd.read_parquet(CAT_PARQUET)
+        c["FoodCode"] = pd.to_numeric(c["FoodCode"], errors="coerce").astype("Int64")
+        nutr_cols = [c for c in c.columns if str(c).startswith("NUTR_")]
+        return c[["FoodCode"] + nutr_cols].copy() if nutr_cols else None
+    return None
+
+# CSV normalizer for fallback CSV uploads
+def normalize_labs(df_in: pd.DataFrame, schema: dict) -> pd.DataFrame:
+    df = df_in.copy()
+    alias_map = {a.lower(): std for std, meta in schema.items() for a in meta.get("aliases", [])}
+    rename = {col: alias_map[col.lower()] for col in df.columns if col.lower() in alias_map}
+    if rename:
+        df = df.rename(columns=rename)
+    keep = list(schema.keys())
+    cols_present = [c for c in keep if c in df.columns]
+    out = df[cols_present].copy()
+    for c in cols_present:
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+    return out
+
+# =============================================================================
+# PhenoAge (Levine)
+# =============================================================================
 def phenoage_from_row(row: pd.Series):
     """
-    Uses official coefficients + Gompertz mapping.
     Inputs (clinical units): albumin g/dL, creat mg/dL, glucose mg/dL, CRP mg/L,
     lymphocyte %, MCV fL, RDW %, ALP U/L, WBC 10^3/µL, age years
     """
@@ -104,59 +158,9 @@ def phenoage_from_row(row: pd.Series):
     accel = pheno - age
     return float(np.clip(pheno, 0.0, 140.0)), float(np.clip(accel, -60.0, 90.0))
 
-# ---------------- Loaders ----------------
-# ---------------- Loaders ----------------
-# ---------------- Loaders ----------------
-@st.cache_data(show_spinner=False)
-def load_lab_schema():
-    if LAB_SCHEMA_JS.exists():
-        with open(LAB_SCHEMA_JS, "r") as f:
-            return json.load(f)
-    # minimal fallback schema
-    return {
-        "age_years":{"unit":"years","aliases":["age","age_yrs"]},
-        "albumin":{"unit":"g/dL","aliases":["LBXSAL","albumin"]},
-        "creatinine":{"unit":"mg/dL","aliases":["LBXSCR","creatinine","creat"]},
-        "glucose":{"unit":"mg/dL","aliases":["LBXSGL","glucose"]},
-        "crp_mgL":{"unit":"mg/L","aliases":["CRP","hsCRP","hs-crp","LBXCRP"]},
-        "lymphocyte_pct":{"unit":"%","aliases":["lymphs","lymphocyte %","lymphocytes %"]},
-        "mcv":{"unit":"fL","aliases":["LBXMCVSI","mcv"]},
-        "rdw":{"unit":"%","aliases":["LBXRDW","rdw"]},
-        "alk_phosphatase":{"unit":"U/L","aliases":["LBXSAPSI","alk phos","alkaline phosphatase"]},
-        "wbc":{"unit":"10^3/µL","aliases":["LBXWBCSI","wbc","white blood cells"]},
-    }
-
-@st.cache_data(show_spinner=False)
-def load_catalog() -> pd.DataFrame:
-    cat = pd.read_parquet(CAT_PARQUET)
-    cat["FoodCode"] = pd.to_numeric(cat["FoodCode"], errors="coerce").astype("Int64")
-    if "tags" not in cat.columns:
-        cat["tags"] = np.nan
-    return cat
-
-@st.cache_data(show_spinner=False)
-def load_fnd_features() -> pd.DataFrame | None:
-    """Return FoodCode + NUTR_* (prefer per-100kcal parquet)."""
-    if FND_PARQUET.exists():
-        fnd = pd.read_parquet(FND_PARQUET)
-        fnd["FoodCode"] = pd.to_numeric(fnd["FoodCode"], errors="coerce").astype("Int64")
-        nutr_cols = [c for c in fnd.columns if str(c).startswith("NUTR_")]
-        return fnd[["FoodCode"] + nutr_cols].copy() if nutr_cols else None
-    # fallback: if catalog already contains NUTR_* columns
-    if CAT_PARQUET.exists():
-        c = pd.read_parquet(CAT_PARQUET)
-        nutr_cols = [c for c in c.columns if str(c).startswith("NUTR_")]
-        if nutr_cols:
-            out = c[["FoodCode"] + nutr_cols].copy()
-            out["FoodCode"] = pd.to_numeric(out["FoodCode"], errors="coerce").astype("Int64")
-            return out
-    return None
-
-schema   = load_lab_schema()
-catalog  = load_catalog() if CAT_PARQUET.exists() else None
-fnd_nutr = load_fnd_features()
-
-# ---------------- Dedup + categories used in UI ----------------
+# =============================================================================
+# Food catalog helpers
+# =============================================================================
 _STOPWORDS = re.compile(
     r"\b(ns as to form|nsf|nfs|assume.*?|fat not added in cooking|no added fat|"
     r"from (?:fresh|frozen|canned)|fresh|frozen|canned|raw|cooked|reconstituted|"
@@ -210,33 +214,25 @@ def dedup_rank(df: pd.DataFrame, include_tags: str = "", exclude_tags: str = "")
     R = R.sort_values(["score", "kcal_per_100g"], ascending=[True, True]).drop_duplicates("dedup_key", keep="first")
     return R.reset_index(drop=True)
 
-# ---------------- PDF → labs → sanitize → PhenoAge ----------------
-# ---------------- Robust PDF parser + sanitizer ----------------
+# =============================================================================
+# PDF → labs → sanitize
+# =============================================================================
 def parse_pdf_labs(file_like) -> dict:
     """
     Returns a dict of raw extracted labs. Tries tables first, then text.
     Handles ranges, units (mg/dL vs mg/L), and lymphocytes (# and %).
-    Keys returned when found (raw, before sanitize_labs):
-      albumin (g/dL)
-      creatinine (mg/dL)
-      fasting_glucose or glucose (mg/dL)
-      crp (mg/L or mg/dL handled later)
-      wbc (10^3/µL or cells/µL handled later)
-      lymphs (percent) or lymphs_abs (cells/µL)
-      mcv (fL)
-      rdw (%)
-      alp (U/L)
+    Keys returned when found (raw): albumin, creatinine, (fasting_)glucose, crp, wbc, lymphs or lymphs_abs, mcv, rdw, alp
     """
     if not HAS_PDFPLUMBER:
         raise RuntimeError("pdfplumber not installed. Run: pip install pdfplumber")
 
-    # ---- label synonyms (longest-first wins) ----
+    # label synonyms (longest-first wins)
     synonyms = [
         # Albumin
         ("serum albumin", "albumin"), ("albumin, serum", "albumin"),
         ("albumin (serum)", "albumin"), ("alb", "albumin"), ("albumin", "albumin"),
 
-        # Alkaline phosphatase (many ways)
+        # Alkaline phosphatase
         ("alkaline phosphatase (total)", "alp"), ("alkaline phosphatase, total", "alp"),
         ("alkaline phosphatase (alp)", "alp"), ("alkaline phosphatase (alk phos)", "alp"),
         ("alk phosphatase", "alp"), ("alk. phosphatase", "alp"),
@@ -274,94 +270,77 @@ def parse_pdf_labs(file_like) -> dict:
         ("blood urea nitrogen", "bun"), ("bun", "bun"),
     ]
 
-    # ---- regex helpers ----
     range_pat   = re.compile(r"\b\d+(?:\.\d+)?\s*[-–]\s*\d+(?:\.\d+)?\b")
     number_pat  = re.compile(r"(-?\d+(?:\.\d+)?)")
     percent_pat = re.compile(r"%")
 
     def match_key(lbl: str) -> str | None:
         s = (lbl or "").strip().lower()
-        for name, key in sorted(synonyms, key=lambda kv: -len(kv[0])):  # longest first
+        for name, key in sorted(synonyms, key=lambda kv: -len(kv[0])):
             if name in s:
                 return key
         return None
 
     def first_numeric(txt: str, prefer_percent=False):
-        """Return (value, score) if numeric present and not a range; prefer '%' when asked."""
-        if not txt:
-            return None, None
-        if range_pat.search(txt):
-            return None, None
+        if not txt: return None, None
+        if range_pat.search(txt): return None, None
         m = number_pat.search(txt)
-        if not m:
-            return None, None
+        if not m: return None, None
         val = float(m.group(1))
         has_pct = bool(percent_pat.search(txt))
         score = (1 if (prefer_percent and has_pct) else 0, -len(txt))
         return val, score
 
-    labs: dict = {}
-    aux: dict  = {}      # holds lymphs_abs, lymphs_pct
-    evidence = {}
+    labs, aux, evidence = {}, {}, {}
 
-    # ---- Pass 1: tables ----
+    # tables first
     with pdfplumber.open(file_like) as pdf:
         for page in pdf.pages:
             for tbl in (page.extract_tables() or []):
                 for r_i, row in enumerate(tbl or []):
-                    if not row or all(c is None or str(c).strip() == "" for c in row):
+                    if not row or all(c is None or str(c).strip()=="" for c in row):
                         continue
                     label = str(row[0] or "")
                     key = match_key(label)
-                    if not key:
-                        continue
+                    if not key: continue
 
                     prefer_pct = (key == "lymphs_pct")
                     best = None  # (score, value, raw_text)
 
-                    # cells to the right
                     for cell in row[1:]:
                         txt = str(cell or "")
                         val, score = first_numeric(txt, prefer_percent=prefer_pct)
-                        if val is None:
-                            continue
+                        if val is None: continue
                         cand = (score, val, txt)
                         if (best is None) or (cand > best):
                             best = cand
 
-                    # sometimes the value is directly below the header
                     if best is None and len(row) > 1 and r_i + 1 < len(tbl):
-                        below = str((tbl[r_i + 1] or [""])[1] or "")
+                        below = str((tbl[r_i+1] or [""])[1] or "")
                         val, score = first_numeric(below, prefer_percent=prefer_pct)
                         if val is not None:
                             best = (score, val, below)
 
-                    if best is None:
-                        continue
+                    if best is None: continue
 
                     _, value, rawtxt = best
                     lowtxt = (rawtxt or "").lower()
 
-                    # unit fixes at capture time
                     if key == "crp" and ("mg/dl" in lowtxt) and ("mg/l" not in lowtxt):
                         value *= 10.0
                     if key == "albumin" and "g/l" in lowtxt:
                         value /= 10.0
 
                     if key == "lymphs_abs":
-                        aux["lymphs_abs"] = value
-                        evidence["lymphs_abs"] = (value, rawtxt)
+                        aux["lymphs_abs"] = value; evidence["lymphs_abs"] = (value, rawtxt)
                     elif key == "lymphs_pct":
-                        aux["lymphs_pct"] = value
-                        evidence["lymphs_pct"] = (value, rawtxt)
+                        aux["lymphs_pct"] = value; evidence["lymphs_pct"] = (value, rawtxt)
                     elif key == "wbc":
-                        labs["wbc"] = value
-                        evidence["wbc"] = (value, rawtxt)
+                        labs["wbc"] = value;    evidence["wbc"] = (value, rawtxt)
                     else:
-                        labs[key] = value
-                        evidence[key] = (value, rawtxt)
+                        labs[key] = value;      evidence[key] = (value, rawtxt)
 
-    # ---- Pass 2: text fallback ----
+    # text fallback
     file_like.seek(0)
     full_text = ""
     with pdfplumber.open(file_like) as pdf:
@@ -369,149 +348,104 @@ def parse_pdf_labs(file_like) -> dict:
             full_text += (p.extract_text() or "").replace("\n", " ") + " "
 
     def from_text(label, std_key):
-        if std_key in labs or std_key in aux:
-            return
+        if std_key in labs or std_key in aux: return
         pat = re.compile(rf"(?i)\b{re.escape(label)}\b" + r".{0,120}?" + r"(-?\d+(?:\.\d+)?)")
         m = pat.search(full_text)
-        if not m:
-            return
+        if not m: return
         val = float(m.group(1))
-        window = full_text[max(0, m.start() - 40): m.end() + 40].lower()
-
-        if std_key == "crp" and ("mg/dl" in window) and ("mg/l" not in window):
-            val *= 10.0
-        if std_key == "albumin" and "g/l" in window:
-            val /= 10.0
-
-        if std_key in ("lymphs_pct", "lymphs_abs"):
-            aux[std_key] = val
-            evidence[std_key] = (val, window.strip())
+        window = full_text[max(0, m.start()-40): m.end()+40].lower()
+        if std_key == "crp" and ("mg/dl" in window) and ("mg/l" not in window): val *= 10.0
+        if std_key == "albumin" and "g/l" in window: val /= 10.0
+        if std_key in ("lymphs_pct","lymphs_abs"):
+            aux[std_key] = val;  evidence[std_key] = (val, window.strip())
         else:
-            labs[std_key] = val
-            evidence[std_key] = (val, window.strip())
+            labs[std_key] = val; evidence[std_key] = (val, window.strip())
 
-    # scan all synonyms in free text
     for label, key in synonyms:
         from_text(label, key)
 
-    # --- Extra ALP fallbacks ---
+    # extra ALP fallbacks
     if "alp" not in labs:
         m = re.search(r"(?i)\bALP\b[^\n]{0,40}?(-?\d+(?:\.\d+)?)", full_text)
         if m:
-            with contextlib.suppress(Exception):
-                labs["alp"] = float(m.group(1))
-
+            with contextlib.suppress(Exception): labs["alp"] = float(m.group(1))
     if "alp" not in labs:
         m = re.search(r"(?i)alk[^\n]{0,80}?phos[^\n]{0,80}?(-?\d+(?:\.\d+)?)", full_text)
         if m:
-            with contextlib.suppress(Exception):
-                labs["alp"] = float(m.group(1))
-
+            with contextlib.suppress(Exception): labs["alp"] = float(m.group(1))
     if "alp" not in labs:
         m = re.search(r"(?i)(alk(?:aline)?\s+phosph(?:atase|ate))[^\n]{0,60}?(-?\d+(?:\.\d+)?)", full_text)
         if m:
-            with contextlib.suppress(Exception):
-                labs["alp"] = float(m.group(2))
+            with contextlib.suppress(Exception): labs["alp"] = float(m.group(2))
 
-    # --- derive lymph % from absolute if needed (needs WBC; sanitize will rescale WBC if cells/µL) ---
+    # derive lymph %
     if "lymphs_pct" in aux and "lymphs" not in labs:
-        labs["lymphs"] = aux["lymphs_pct"]
-        evidence["lymphs"] = evidence.get("lymphs_pct", (labs["lymphs"], "% cell"))
-
+        labs["lymphs"] = aux["lymphs_pct"]; evidence["lymphs"] = evidence.get("lymphs_pct", (labs["lymphs"], "% cell"))
     if ("lymphs" not in labs) and ("lymphs_abs" in aux) and ("wbc" in labs):
         try:
-            abs_cells = float(aux["lymphs_abs"])   # cells/µL
-            wbc_k    = float(labs["wbc"])         # may still be cells/µL; fixed in sanitize_labs
+            abs_cells = float(aux["lymphs_abs"]); wbc_k = float(labs["wbc"])
             pct = (abs_cells / (wbc_k * 1000.0)) * 100.0
-            labs["lymphs"] = pct
-            evidence["lymphs"] = (pct, f"derived from abs {aux['lymphs_abs']} and wbc {labs['wbc']}")
+            labs["lymphs"] = pct; evidence["lymphs"] = (pct, f"derived from abs {aux['lymphs_abs']} and wbc {labs['wbc']}")
         except Exception:
             pass
 
-    # for optional UI debugging
     labs["_evidence"] = evidence
     return labs
 
-
-
 def sanitize_labs(labs: dict) -> dict:
-    """
-    Normalize units and clamp to plausible ranges.
-    - WBC: cells/µL → 10^3/µL if needed
-    - Lymphocytes: fix absolute vs percent confusion; clamp 1–80%
-    - CRP: assume mg/L; if extreme, treat as mg/dL*10
-    """
     x = dict(labs) if labs else {}
 
     # WBC normalization
     if "wbc" in x and x["wbc"] is not None:
         try:
             w = float(x["wbc"])
-            # If large, it's almost certainly cells/µL (e.g., 5400) → convert to 10^3/µL (5.4)
-            if w > 100:
-                w = w / 1000.0
+            if w > 100: w = w / 1000.0
             x["wbc"] = float(np.clip(w, 0.1, 50.0))
         except Exception:
             pass
 
-    # Lymphocytes normalization
-    # a) compute % from abs if needed (requires wbc already normalized)
+    # Lymphs
     if x.get("lymphs") is None and x.get("lymphs_abs") is not None and x.get("wbc") not in (None, 0):
         try:
-            abs_cells = float(x["lymphs_abs"])
-            wbc_k     = float(x["wbc"])
-            pct = (abs_cells / (wbc_k * 1000.0)) * 100.0
-            x["lymphs"] = pct
-        except Exception:
-            pass
-
-    # b) fix when a percent looks like absolute or is off by ×10 or ×100
+            abs_cells = float(x["lymphs_abs"]); wbc_k = float(x["wbc"])
+            x["lymphs"] = (abs_cells / (wbc_k * 1000.0)) * 100.0
+        except Exception: pass
     if x.get("lymphs") is not None:
         try:
             l = float(x["lymphs"])
-            if l > 1000 and x.get("wbc"):  # absolute mistaken as percent
+            if l > 1000 and x.get("wbc"):
                 l = (l / (float(x["wbc"]) * 1000.0)) * 100.0
-            if l > 100:                     # e.g., 175.3 → 17.53
-                l = l / 10.0 if l <= 300 else l / 100.0
+            if l > 100: l = l/10.0 if l <= 300 else l/100.0
             x["lymphs"] = float(np.clip(l, 1.0, 80.0))
-        except Exception:
-            pass
+        except Exception: pass
 
-    # CRP normalization to mg/L
+    # CRP → mg/L
     if x.get("crp") is not None:
         try:
             c = float(x["crp"])
-            # if someone reported mg/dL and we missed it, values like 0.3 mg/dL → 3 mg/L
-            if 0 < c < 2 and ("_evidence" in x) and isinstance(x["_evidence"], dict):
-                # leave small values alone unless evidence said mg/dL; handled in parser
-                pass
-            if c > 200:  # crazy large values → probably mg/dL; convert
-                c = c * 10.0
+            if c > 200: c = c * 10.0
             x["crp"] = float(np.clip(c, 0.0, 500.0))
-        except Exception:
-            pass
+        except Exception: pass
 
-    # Clip typical ranges (prevents model blow-ups)
+    # Clamps
     def _clip(k, lo, hi):
-        if x.get(k) is None:
-            return
+        if x.get(k) is None: return
         with contextlib.suppress(Exception):
             x[k] = float(np.clip(float(x[k]), lo, hi))
-
-    _clip("albumin", 2.0, 6.5)       # g/dL
-    _clip("glucose", 40.0, 500.0)    # mg/dL (fasting or random — handled same)
-    _clip("creatinine", 0.2, 12.0)   # mg/dL
-    _clip("alp", 10.0, 1500.0)       # U/L
-    _clip("mcv", 60.0, 130.0)        # fL
-    _clip("rdw", 8.0, 30.0)          # %
-    # wbc already clipped
+    _clip("albumin", 2.0, 6.5)
+    _clip("glucose", 40.0, 500.0)
+    _clip("creatinine", 0.2, 12.0)
+    _clip("alp", 10.0, 1500.0)
+    _clip("mcv", 60.0, 130.0)
+    _clip("rdw", 8.0, 30.0)
     return x
 
-# ---------------- Marker map & severity ----------------
+# =============================================================================
+# Marker map & severity
+# =============================================================================
 MARKER_MAP = {
-    # marker_key -> specs + model target code for per-food predictions
     "glucose":         {"label":"Glucose",          "units":"mg/dL",  "dir":"high", "goal":(70, 99),   "target":"LBXSGL"},
-    "crp_mgL":         {"label":"CRP (hs)",         "units":"mg/L",   "dir":"high", "goal":(0.0, 3.0), "target":"LBXCRP"},  # model may be missing; handled gracefully
+    "crp_mgL":         {"label":"CRP (hs)",         "units":"mg/L",   "dir":"high", "goal":(0.0, 3.0), "target":"LBXCRP"},  # may be missing
     "albumin":         {"label":"Albumin",          "units":"g/dL",   "dir":"low",  "goal":(3.8, 5.0), "target":"LBXSAL"},
     "lymphocyte_pct":  {"label":"Lymphocytes",      "units":"%",      "dir":"low",  "goal":(20, 40),   "target":None},
     "rdw":             {"label":"RDW",              "units":"%",      "dir":"high", "goal":(11.5,14.5),"target":"LBXRDW"},
@@ -542,12 +476,14 @@ def compute_marker_severity(labs_row: pd.Series) -> dict:
         out[key] = {"value":val, "status":status, "severity":sev, "label":meta["label"], "units":meta["units"]}
     return out
 
-# ---------------- Per-food predictor ----------------
+# =============================================================================
+# Per-food predictor
+# =============================================================================
 @st.cache_data(show_spinner=False)
 def load_perfood_bundle():
     """
-    Load the per-marker ML bundle from models/PerFood (or models/Perfood).
-    Returns: {"dir": str, "meta": dict, "scaler": object|None, "models": dict[str, object]} or None
+    Load per-marker ML bundle from models/PerFood (or models/Perfood).
+    Returns dict or None.
     """
     mdl_dir = root / "models" / "PerFood"
     if not mdl_dir.exists():
@@ -585,45 +521,62 @@ def load_perfood_bundle():
         st.error(f"No *.joblib models found in {mdl_dir}.")
         return None
 
-    return {"dir": str(mdl_dir), "meta": meta, "scaler": scaler, "models": models}
+    # Feature names may live under different keys
+    features = meta.get("features") or meta.get("feature_names")
+    r2_map   = {}
+    with contextlib.suppress(Exception):
+        r2_csv = next((mdl_dir / "per_target_r2.csv",), None)
+        if r2_csv and r2_csv.exists():
+            r2 = pd.read_csv(r2_csv)
+            if {"target","r2"}.issubset(r2.columns):
+                r2_map = {str(t): float(r) for t, r in zip(r2["target"], r2["r2"])}
+
+    return {"dir": str(mdl_dir), "meta": meta, "features": features, "scaler": scaler, "models": models, "r2_map": r2_map}
 
 def build_feature_matrix(food_df: pd.DataFrame, fnd_df: pd.DataFrame | None, required: list[str] | None) -> pd.DataFrame | None:
-    """
-    Return DataFrame X with shape [n_foods, n_features] aligned to required features.
-    We use FNDDS features if present; else try columns in catalog.
-    """
+    """Return DataFrame X with shape [n_foods, n_features] aligned to required features."""
     if required is None:
-        # auto-discover NUTR_* columns
         src = fnd_df if (fnd_df is not None) else food_df
         cols = [c for c in src.columns if str(c).startswith("NUTR_")]
-        if not cols: return None
+        if not cols:
+            return None
         required = cols
     if fnd_df is not None and set(required).issubset(fnd_df.columns):
-        X = food_df[["FoodCode"]].merge(fnd_df[["FoodCode"] + required], on="FoodCode", how="left")
+        X = food_df[["FoodCode"]].merge(fnd_df[["FoodCode"] + list(required)], on="FoodCode", how="left")
     else:
-        if not set(required).issubset(food_df.columns): return None
-        X = food_df[["FoodCode"] + required].copy()
-    # fill missing with zeros (or small eps)
+        if not set(required).issubset(food_df.columns):
+            return None
+        X = food_df[["FoodCode"] + list(required)].copy()
     for c in required:
         if c not in X.columns: X[c] = 0.0
-    return X.set_index("FoodCode")[required].astype(float)
+    return X.set_index("FoodCode")[list(required)].astype(float)
 
-def predict_targets(bundle, X: pd.DataFrame) -> pd.DataFrame:
-    """Apply scaler + each target model; return DF indexed by FoodCode with columns per target."""
-    scaler = bundle["scaler"]; models = bundle["models"]
-    if X is None or X.empty or not models: return pd.DataFrame(index=X.index)
-    Xs = pd.DataFrame(scaler.transform(X), index=X.index, columns=X.columns)
+def predict_targets(bundle: dict, X: pd.DataFrame) -> pd.DataFrame:
+    """Apply scaler + each target model; return DF indexed by FoodCode with columns per target code."""
+    if X is None or X.empty or not bundle or not bundle.get("models"):
+        return pd.DataFrame(index=X.index if X is not None else None)
+
+    scaler = bundle.get("scaler")
+    if scaler is not None:
+        with contextlib.suppress(Exception):
+            Xs = pd.DataFrame(scaler.transform(X), index=X.index, columns=X.columns)
+    else:
+        Xs = X
+
     preds = {}
-    for tgt, mdl in models.items():
+    for tgt, mdl in bundle["models"].items():
         try:
-            preds[tgt] = np.asarray(mdl.predict(Xs)).astype(float)
+            preds[tgt.split(".")[0].split("_")[-1]] = np.asarray(mdl.predict(Xs)).astype(float)  # normalize stem to code if needed
         except Exception:
             continue
-    if not preds: return pd.DataFrame(index=X.index)
-    P = pd.DataFrame(preds, index=X.index)
-    return P
 
-# ---------------- Preference adjustments (diet/exclusions/dislikes) ----------------
+    if not preds:
+        return pd.DataFrame(index=X.index)
+    return pd.DataFrame(preds, index=X.index)
+
+# =============================================================================
+# Preference filters
+# =============================================================================
 _EXCL_PATTERNS = {
     "dairy-free":      re.compile(r"\b(milk|cheese|yogurt|kefir|cream|butter|whey|casein|ghee|custard|ice cream)\b", re.I),
     "gluten-free":     re.compile(r"\b(wheat|barley|rye|farro|couscous|bulgur|seitan)\b", re.I),
@@ -638,7 +591,6 @@ _DIET_BLOCK = {
     "Vegetarian":   re.compile(r"\b(beef|pork|chicken|turkey|lamb|veal|fish|salmon|tuna|shrimp|oyster|clam|crab|lobster)\b", re.I),
     "Pescatarian":  re.compile(r"\b(beef|pork|chicken|turkey|lamb|veal)\b", re.I),
 }
-
 def apply_hard_filters(df: pd.DataFrame, diet_pattern: str, exclusions: list[str], dislikes: str) -> pd.DataFrame:
     R = df.copy()
     desc = R["Desc"].fillna("").astype(str)
@@ -654,11 +606,13 @@ def apply_hard_filters(df: pd.DataFrame, diet_pattern: str, exclusions: list[str
             R = R[~desc.str.contains(bad_re)]
     return R
 
-# ---------------- UI ----------------
-st.title("Blood→Food: BioAge + Marker-Targeted Recs")
+# =============================================================================
+# UI
+# =============================================================================
+st.title("Blood→Food: BioAge + Marker-Targeted Recommendations")
 
 with st.sidebar:
-    st.markdown("**Data paths**")
+    st.markdown("**Paths**")
     st.text(f"Root: {root}")
     include_tags = st.text_input("Include tags (comma-separated)", value="")
     exclude_tags = st.text_input("Exclude tags (comma-separated)", value="")
@@ -680,9 +634,8 @@ with st.sidebar:
     run_clicked = st.button("Parse labs & compute recommendations")
 
 schema   = load_lab_schema()
-catalog  = load_catalog() if CAT_PARQUET.exists() else None
-fnd_nutr = load_fnd_features()  # you’ll pass this into your recommender
-
+catalog  = load_catalog()
+fnd_nutr = load_fnd_features()
 
 parsed_df = None
 if run_clicked:
@@ -716,101 +669,88 @@ if run_clicked:
         }
         parsed_df = pd.DataFrame([mapped])
 
-# ---- Labs + BioAge metrics ----
-# -------- 2) Show normalized labs & BioAge --------
-st.subheader("2) Parsed labs & BioAge")
-
+# ---- Labs & BioAge
+st.subheader("Parsed labs & BioAge")
 def _have_all_needed_cols(df: pd.DataFrame) -> bool:
     need = ["age_years","albumin","creatinine","glucose","crp_mgL",
             "lymphocyte_pct","mcv","rdw","alk_phosphatase","wbc"]
     return all(c in df.columns for c in need)
 
 if isinstance(parsed_df, pd.DataFrame) and not parsed_df.empty and _have_all_needed_cols(parsed_df):
-    st.caption("Parsed (normalized) labs used for scoring:")
     st.dataframe(parsed_df, use_container_width=True)
-
-    # ensure empty strings/None become NaN for the model check
     safe_row = parsed_df.iloc[0].apply(lambda v: np.nan if v in (None, "") else v)
     bio, accel = phenoage_from_row(safe_row)
-
     c1, c2 = st.columns(2)
     with c1: st.metric("BioAge (PhenoAge)", f"{bio:.1f}" if bio is not None else "–")
     with c2: st.metric("BioAgeAccel", f"{accel:+.1f}" if accel is not None else "–")
 else:
-    st.info("Upload a PDF/CSV, enter age, then click the button to parse and compute BioAge.")
+    st.info("Upload & run to parse labs and compute BioAge.")
 
-
-# ---- Recommendations ----
+# ---- Recommendations
 st.subheader("Food recommendations")
 
 if parsed_df is None:
     st.info("Awaiting labs…")
-elif catalog is None:
+elif catalog is None or catalog.empty:
     st.error("Food catalog not found (app_assets/food_catalog.parquet).")
 else:
-    # 1) Filter + de-dupe + category
+    # 1) filter + de-dupe + category
     R_all = dedup_rank(catalog, include_tags, exclude_tags).copy()
     R_all["category"] = [coarse_category(d, t) for d, t in zip(R_all["Desc"], R_all["tags"])]
-
-    # 2) Apply user hard filters
+    # 2) user hard filters
     R_all = apply_hard_filters(R_all, diet_pattern, exclusions, dislikes)
 
-    # 3) Per-food predictions (if models available)
+    # 3) per-food predictions
+    P = None
     bundle = load_perfood_bundle()
     if bundle is None:
-        st.warning("Per-marker ML bundle not found. Skipping per-marker recommendations. "
-                   "Ensure models/PerFood (or models/Perfood) contains meta.json, X_scaler.joblib, and *.joblib models.")
+        st.warning("Per-marker ML bundle not found. Skipping per-marker recommendations.")
     else:
         req_feats = bundle.get("features")
         X = build_feature_matrix(R_all, fnd_nutr, req_feats)
         if X is None:
-            st.warning("Could not build NUTR_* feature matrix for foods. Ensure FNDDS parquet (processed/FNDDS_MASTER_PER100G.parquet) or catalog has NUTR_* columns.")
+            st.warning("Could not build NUTR_* feature matrix for foods. Ensure processed/FNDDS_MASTER_PER100G.parquet exists or catalog has NUTR_* columns.")
         else:
             P = predict_targets(bundle, X)
+            st.caption(f"Loaded PerFood models from: {bundle['dir']}")
 
-    # 4) Marker severity
+    # 4) marker severity
     sev = compute_marker_severity(parsed_df.iloc[0])
 
-    # 5) Marker impact from predictions
+    # 5) marker impact
     impact_total = pd.Series(0.0, index=R_all["FoodCode"].astype("Int64"))
-    per_marker_tables = {}  # for the marker cards
+    per_marker_tables = {}
 
     if P is not None and not P.empty:
-        # robust scale per predicted target for goal-oriented benefit
-        def goal_benefit(target_code: str, pred: pd.Series, meta: dict) -> pd.Series:
-            # robust sigma of predicted distribution
+        def goal_benefit(pred: pd.Series, meta: dict) -> pd.Series:
             med = np.nanmedian(pred); iqr = np.nanpercentile(pred, 75) - np.nanpercentile(pred, 25)
             sigma = iqr/1.349 if iqr and np.isfinite(iqr) and iqr>0 else np.nanstd(pred)
-            if not (sigma and np.isfinite(sigma) and sigma>0): sigma = 1.0
+            sigma = sigma if sigma and np.isfinite(sigma) and sigma>0 else 1.0
             lo, hi = meta["goal"]
             if meta["dir"] == "high":
-                b = (hi - pred) / sigma  # higher benefit if prediction is below high goal
+                b = (hi - pred) / sigma
             else:
-                b = (pred - lo) / sigma  # higher benefit if prediction is above low goal
-            return b.clip(-3, 3)  # guard extremes
+                b = (pred - lo) / sigma
+            return b.clip(-3, 3)
 
         r2_map = bundle.get("r2_map", {})
-        # Build impact per marker
         for mkey, meta in MARKER_MAP.items():
             tgt = meta.get("target")
             if not tgt or tgt not in P.columns:
-                continue  # no model for this marker
+                continue
             sev_w = sev.get(mkey, {}).get("severity", 0.0)
             if sev_w <= 0 and mkey != "glucose":
-                # if inside goal, give tiny weight so list still varies; glucose keeps small weight for energy balance
                 sev_w = 0.1
-            conf = clip01((float(r2_map.get(tgt, 0.0)) - 0.10) / 0.20)  # ~0 at r2<=0.10, ~1 near 0.30+
+            conf = clip01((float(r2_map.get(tgt, 0.0)) - 0.10) / 0.20) if r2_map else 0.6
             if conf <= 0:
                 continue
 
             pred = P[tgt]
-            benefit = goal_benefit(tgt, pred, meta)
+            benefit = goal_benefit(pred, meta)
             imp = sev_w * conf * benefit
 
-            # accumulate
             impact_total = impact_total.add(pd.Series(imp.values, index=P.index), fill_value=0.0)
 
-            # store per-marker top-k for UI cards
             dfm = (R_all.set_index("FoodCode")
                       .assign(pred=pred, impact=imp)
                       .sort_values("impact", ascending=False)
@@ -818,13 +758,13 @@ else:
                       .rename(columns={"impact":"impact_score"}))
             per_marker_tables[mkey] = dfm.reset_index()
 
-    # 6) Blend with BioAge score
+    # 6) blend with BioAge score
     base = pd.to_numeric(R_all["score"], errors="coerce").astype(float)
     base_z = robust_z(base)
     blended = w_bioage * base_z - w_marker * impact_total.reindex(R_all["FoodCode"].astype("Int64")).fillna(0.0).values
     R_all["score_final"] = blended
 
-    # 7) Show overall table
+    # 7) overall table
     top_overall = R_all.sort_values("score_final", ascending=True).head(100).copy()
     st.markdown("**Top 100 overall (lower = better; blended BioAge + Marker)**")
     st.dataframe(
@@ -833,15 +773,13 @@ else:
         use_container_width=True
     )
 
-    # 8) Marker cards (from per-marker impacts, if any)
+    # 8) marker cards
     st.subheader("Foods by marker (model-targeted)")
     cols = st.columns(2); i = 0
     for mkey, meta in MARKER_MAP.items():
         info = sev.get(mkey, {})
         val = info.get("value"); status = info.get("status"); units = meta["units"]; label = meta["label"]
-        if status == "high": glyph = "🔺"
-        elif status == "low": glyph = "🔻"
-        else: glyph = "✅"
+        glyph = "🔺" if status == "high" else ("🔻" if status == "low" else "✅")
         with cols[i % 2]:
             with st.container():
                 st.markdown(f"**{label}** — {glyph} {('%.2f' % val) if val is not None else '—'} {units}")
@@ -855,7 +793,7 @@ else:
                     st.dataframe(show, use_container_width=True, hide_index=True)
         i += 1
 
-    # 9) Category tabs using blended score
+    # 9) category tabs
     st.subheader("Browse by category")
     tabs = st.tabs(["Protein","Fats","Fruit","Vegetables","Legume/Grains","Other"])
     CAT_ORDER = ["protein","fats","fruit","vegetables","legume_grains","other"]
@@ -878,4 +816,3 @@ else:
                     file_name=f"top_{cat}.csv",
                     key=f"dl_{cat}"
                 )
-
