@@ -539,44 +539,55 @@ def compute_marker_severity(labs_row: pd.Series) -> dict:
 @st.cache_data(show_spinner=False)
 def load_perfood_bundle():
     """
-    Loads the per-food/per-marker ML bundle:
+    Load the per-marker ML bundle from models/PerFood or models/Perfood:
       - meta.json
       - X_scaler.joblib
-      - one or more *.joblib models (per-target)
-    Returns dict or None if not found:
-      {
-        "dir": str(Path),
-        "meta": dict,
-        "scaler": sklearn transformer or None,
-        "models": {model_name: estimator}
-      }
+      - *.joblib models
+    Returns dict or None.
     """
-    # choose the first folder that exists
-    mdl_dir = None
-    for cand in (PERFOOD_DIR, PERFOOD_ALT):
-        if cand.exists():
-            mdl_dir = cand
-            break
-    if mdl_dir is None:
+    # Compute paths locally (no reliance on external globals)
+    mdl_dir = root / "models" / "PerFood"
+    if not mdl_dir.exists():
+        mdl_dir = root / "models" / "Perfood"
+    if not mdl_dir.exists():
         return None
+
+    meta_path = mdl_dir / "meta.json"
+    scaler_path = mdl_dir / "X_scaler.joblib"
 
     # meta
     meta = {}
-    meta_path = mdl_dir / PERFOOD_META
     if meta_path.exists():
-        try:
+        with contextlib.suppress(Exception):
             with open(meta_path, "r") as f:
                 meta = json.load(f)
-        except Exception:
-            pass
+
+    # joblib loader
+    try:
+        from joblib import load as joblib_load
+    except Exception:
+        st.error("Missing dependency 'joblib'. Add it to requirements.txt.")
+        return None
 
     # scaler
     scaler = None
-    try:
-        from joblib import load as joblib_load
-    except Exception as e:
-        st.error("The 'joblib' package is required for loading per-marker models. Add 'joblib' to requirements.txt.")
+    if scaler_path.exists():
+        with contextlib.suppress(Exception):
+            scaler = joblib_load(scaler_path)
+
+    # models (all *.joblib except the scaler)
+    models = {}
+    for p in mdl_dir.glob("*.joblib"):
+        if p.name == "X_scaler.joblib":
+            continue
+        with contextlib.suppress(Exception):
+            models[p.stem] = joblib_load(p)
+
+    if not models:
         return None
+
+    return {"dir": str(mdl_dir), "meta": meta, "scaler": scaler, "models": models}
+
 
     scal_path = mdl_dir / PERFOOD_SCALER
     if scal_path.exists():
