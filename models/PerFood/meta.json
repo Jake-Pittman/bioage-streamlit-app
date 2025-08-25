@@ -1,0 +1,227 @@
+{
+  "model_name": "FinalModel",
+  "seed": 42,
+  "nutrient_cols": [
+    "NUTR_203",
+    "NUTR_204",
+    "NUTR_205",
+    "NUTR_208",
+    "NUTR_221",
+    "NUTR_255",
+    "NUTR_262",
+    "NUTR_263",
+    "NUTR_269",
+    "NUTR_291",
+    "NUTR_301",
+    "NUTR_303",
+    "NUTR_304",
+    "NUTR_305",
+    "NUTR_306",
+    "NUTR_307",
+    "NUTR_309",
+    "NUTR_312",
+    "NUTR_317",
+    "NUTR_319",
+    "NUTR_320",
+    "NUTR_321",
+    "NUTR_322",
+    "NUTR_323",
+    "NUTR_328",
+    "NUTR_334",
+    "NUTR_337",
+    "NUTR_338",
+    "NUTR_401",
+    "NUTR_404",
+    "NUTR_405",
+    "NUTR_406",
+    "NUTR_415",
+    "NUTR_417",
+    "NUTR_418",
+    "NUTR_421",
+    "NUTR_430",
+    "NUTR_431",
+    "NUTR_432",
+    "NUTR_435",
+    "NUTR_573",
+    "NUTR_578",
+    "NUTR_601",
+    "NUTR_606",
+    "NUTR_607",
+    "NUTR_608",
+    "NUTR_609",
+    "NUTR_610",
+    "NUTR_611",
+    "NUTR_612",
+    "NUTR_613",
+    "NUTR_614",
+    "NUTR_617",
+    "NUTR_618",
+    "NUTR_619",
+    "NUTR_620",
+    "NUTR_621",
+    "NUTR_626",
+    "NUTR_627",
+    "NUTR_628",
+    "NUTR_629",
+    "NUTR_630",
+    "NUTR_631",
+    "NUTR_645",
+    "NUTR_646"
+  ],
+  "targets_requested": [
+    "LBXSGL",
+    "LBXSCH",
+    "LBDHDL",
+    "LBDLDL",
+    "LBXSTR",
+    "LBXSUA",
+    "LBXSCR",
+    "LBXSBU",
+    "LBXSCA",
+    "LBXSNA",
+    "LBXSKSI",
+    "LBXCLSI",
+    "LBXSAPSI",
+    "LBXAST",
+    "LBXALT",
+    "LBXSAL",
+    "LBXTP",
+    "LBXTB",
+    "LBXHGB",
+    "LBXHCT",
+    "LBXRBCSI",
+    "LBXMCVSI",
+    "LBXMCHSI",
+    "LBXMCHCSI",
+    "LBXRDW",
+    "<25OHD>",
+    "<Ferritin>"
+  ],
+  "targets_present": [
+    "LBXSKSI",
+    "LBXSCH",
+    "LBXSCA",
+    "LBXSAL",
+    "LBXSUA",
+    "LBXSGL",
+    "LBXSBU",
+    "LBXSCR",
+    "LBXSTR",
+    "LBXHGB",
+    "LBXHCT",
+    "LBXMCVSI",
+    "LBXMCHSI",
+    "LBXSAPSI",
+    "LBXRBCSI",
+    "LBXRDW"
+  ],
+  "targets_missing": [
+    "LBDHDL",
+    "LBDLDL",
+    "LBXSNA",
+    "LBXCLSI",
+    "LBXAST",
+    "LBXALT",
+    "LBXTP",
+    "LBXTB",
+    "LBXMCHCSI"
+  ],
+  "mean_r2": 0.17335315067696797,
+  "per_target_r2": [
+    [
+      "LBXSKSI",
+      0.2731623232974649
+    ],
+    [
+      "LBXSCH",
+      0.27263247889452147
+    ],
+    [
+      "LBXSCA",
+      0.2723053805561947
+    ],
+    [
+      "LBXSAL",
+      0.27103436374109346
+    ],
+    [
+      "LBXSUA",
+      0.26972367548477305
+    ],
+    [
+      "LBXSGL",
+      0.22430305303294584
+    ],
+    [
+      "LBXSBU",
+      0.2127877253467162
+    ],
+    [
+      "LBXSCR",
+      0.18227418106967042
+    ],
+    [
+      "LBXSTR",
+      0.133650160488459
+    ],
+    [
+      "LBXHGB",
+      0.11692794154062758
+    ],
+    [
+      "LBXHCT",
+      0.115974363271511
+    ],
+    [
+      "LBXMCVSI",
+      0.10975715676981168
+    ],
+    [
+      "LBXMCHSI",
+      0.1042416558320709
+    ],
+    [
+      "LBXSAPSI",
+      0.08504094285874153
+    ],
+    [
+      "LBXRBCSI",
+      0.06753024513604222
+    ],
+    [
+      "LBXRDW",
+      0.062304763510843575
+    ]
+  ],
+  "best_iterations": {
+    "LBXSGL": 1473,
+    "LBXSCH": 940,
+    "LBXSTR": 320,
+    "LBXSUA": 1034,
+    "LBXSCR": 541,
+    "LBXSBU": 849,
+    "LBXSCA": 740,
+    "LBXSKSI": 1772,
+    "LBXSAPSI": 421,
+    "LBXSAL": 969,
+    "LBXHGB": 136,
+    "LBXHCT": 235,
+    "LBXRBCSI": 135,
+    "LBXMCVSI": 115,
+    "LBXMCHSI": 116,
+    "LBXRDW": 126
+  },
+  "lightgbm_params": {
+    "n_estimators": 5000,
+    "learning_rate": 0.02,
+    "num_leaves": 255,
+    "max_depth": 8,
+    "min_child_samples": 40,
+    "subsample": 0.85,
+    "colsample_bytree": 0.9,
+    "reg_lambda": 1.0,
+    "random_state": 42
+  },
+  "train_rows": 30830,
+  "val_rows": 7708
+}
