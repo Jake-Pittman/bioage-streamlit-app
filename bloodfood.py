@@ -51,7 +51,7 @@ except Exception:
     HAS_PDFPLUMBER = False
 
 # =============================================================================
-st.cache_data.clear()
+
 
 # Small helpers
 # =============================================================================
@@ -533,17 +533,17 @@ def compute_marker_severity(labs_row: pd.Series) -> dict:
 # =============================================================================
 # --- NEW: v2 loader; ignores old globals like PERFOOD_DIR/PERFOOD_ALT ---
 @st.cache_data(show_spinner=False)
-def load_perfood_bundle():
+def load_perfood_bundle(base_dir: Path | None = None):
     """
     Load per-marker ML bundle from models/PerFood (or models/Perfood).
-    Returns dict with: dir, meta, features, scaler, models, r2_map  — or None.
+    Returns dict with: dir, meta, features, scaler, models, r2_map — or None.
     """
-    # Resolve directory (case-insensitive fallback)
-    mdl_dir = root / "models" / "PerFood"
+    base = Path(base_dir) if base_dir else (root / "models")
+    mdl_dir = base / "PerFood"
     if not mdl_dir.exists():
-        mdl_dir = root / "models" / "Perfood"
+        mdl_dir = base / "Perfood"
     if not mdl_dir.exists():
-        st.warning(f"PerFood models folder not found under {root / 'models'}.")
+        st.warning(f"PerFood models folder not found under {base}.")
         return None
 
     # meta.json (optional)
@@ -552,13 +552,13 @@ def load_perfood_bundle():
     if meta_path.exists():
         with contextlib.suppress(Exception):
             meta = json.load(open(meta_path))
-    features = meta.get("features")  # may be None
+    features = meta.get("features")
 
-    # joblib dependency
+    # joblib
     try:
         from joblib import load as joblib_load
     except Exception:
-        st.error("Missing dependency 'joblib'. Add 'joblib' to requirements.txt and redeploy.")
+        st.error("Missing dependency 'joblib'. Add it to requirements.txt and redeploy.")
         return None
 
     # scaler (optional)
@@ -568,15 +568,13 @@ def load_perfood_bundle():
         with contextlib.suppress(Exception):
             scaler = joblib_load(scal_path)
 
-    # load all LightGBM models (*.joblib) except the scaler
+    # models (*.joblib except scaler)
     models = {}
     for p in mdl_dir.glob("*.joblib"):
         if p.name == "X_scaler.joblib":
             continue
-        try:
+        with contextlib.suppress(Exception):
             models[p.stem] = joblib_load(p)
-        except Exception as e:
-            st.warning(f"Failed to load {p.name}: {e}")
 
     if not models:
         st.error(f"No *.joblib models found in {mdl_dir}.")
@@ -588,20 +586,12 @@ def load_perfood_bundle():
     if r2_path.exists():
         with contextlib.suppress(Exception):
             r2df = pd.read_csv(r2_path)
-            if {"target","r2"}.issubset(r2df.columns):
+            if {"target", "r2"}.issubset(r2df.columns):
                 r2_map = dict(zip(r2df["target"], r2df["r2"]))
 
+    st.sidebar.caption(f"PerFood dir: {mdl_dir}")  # small breadcrumb
     return {"dir": str(mdl_dir), "meta": meta, "features": features,
             "scaler": scaler, "models": models, "r2_map": r2_map}
-
-    return {
-        "dir": str(mdl_dir),
-        "meta": meta,
-        "features": features,
-        "scaler": scaler,
-        "models": models,
-        "r2_map": r2_map,
-    }
 
     # Feature names may live under different keys
     features = meta.get("features") or meta.get("feature_names")
@@ -783,17 +773,17 @@ else:
     R_all = apply_hard_filters(R_all, diet_pattern, exclusions, dislikes)
 
     # 3) per-food predictions
+    # 3) per-food predictions
     P = None
-    bundle = load_perfood_bundle_v2(root / "models")
+    bundle = load_perfood_bundle()  # no _v2, no args
 
     if bundle is None:
         st.warning("Per-marker ML bundle not found. Skipping per-marker recommendations.")
     else:
-            req_feats = bundle.get("features")
-            X = build_feature_matrix(R_all, fnd_nutr, req_feats)   # <-- fnd_nutr (not fnd_feats)
-
+        req_feats = bundle.get("features")
+        X = build_feature_matrix(R_all, fnd_nutr, req_feats)
         if X is None:
-            st.warning("Could not build NUTR_* feature matrix for foods. Ensure processed/FNDDS_MASTER_PER100G.parquet exists or catalog has NUTR_* columns.")
+            st.warning("Could not build NUTR_* feature matrix. Ensure processed/FNDDS_MASTER_PER100G.parquet exists or catalog has NUTR_* columns.")
         else:
             P = predict_targets(bundle, X)
             st.caption(f"Loaded PerFood models from: {bundle['dir']}")
