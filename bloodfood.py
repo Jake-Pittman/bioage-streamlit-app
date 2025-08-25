@@ -787,8 +787,9 @@ else:
     if bundle is None:
         st.warning("Per-marker ML bundle not found. Skipping per-marker recommendations.")
     else:
-        req_feats = bundle.get("features")
-        X = build_feature_matrix(R_all, fnd_nutr, req_feats)
+            req_feats = bundle.get("features")
+            X = build_feature_matrix(R_all, fnd_nutr, req_feats)   # <-- fnd_nutr (not fnd_feats)
+
         if X is None:
             st.warning("Could not build NUTR_* feature matrix for foods. Ensure processed/FNDDS_MASTER_PER100G.parquet exists or catalog has NUTR_* columns.")
         else:
