@@ -11,9 +11,16 @@ import pandas as pd
 import streamlit as st
 
 # ---------------- Paths (MUST be defined before loaders) ----------------
+# ---------------- Paths ----------------
 REPO_ROOT = Path(__file__).resolve().parent
 env_root  = os.environ.get("BIOAGE_ROOT")
 root      = Path(env_root) if env_root else REPO_ROOT
+
+# ADD THESE 3 LINES ↓
+MODELS_DIR   = root / "models"
+PERFOOD_DIR  = MODELS_DIR / "PerFood"
+PERFOOD_ALT  = MODELS_DIR / "Perfood"
+
 
 PROC   = root / "processed"
 ASSETS = root / "app_assets"
