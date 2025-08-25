@@ -223,15 +223,46 @@ def coarse_category(desc: str, tags: str) -> str:
 
 def dedup_rank(df: pd.DataFrame, include_tags: str = "", exclude_tags: str = "") -> pd.DataFrame:
     R = df.copy()
+
+    def row_has_token(row_text: str, token: str) -> bool:
+        return token in (row_text or "").lower()
+
+    def desc_has_keyword(desc: str, token: str) -> bool:
+        # word-boundary search; also matches plural (fish vs fishes)
+        return re.search(rf"\b{re.escape(token)}(es|s)?\b", str(desc or ""), re.I) is not None
+
+    # --- Include filter: match tags OR fall back to description keywords
     if include_tags.strip():
-        inc = [t.strip() for t in include_tags.split(",") if t.strip()]
-        R = R[R["tags"].fillna("").apply(lambda s: any(t in s for t in inc))]
+        inc = [t.strip().lower() for t in include_tags.split(",") if t.strip()]
+        R = R[
+            R.apply(
+                lambda r: any(
+                    row_has_token(r.get("tags", ""), t) or desc_has_keyword(r.get("Desc", ""), t)
+                    for t in inc
+                ),
+                axis=1,
+            )
+        ]
+
+    # --- Exclude filter: match tags OR fall back to description keywords
     if exclude_tags.strip():
-        exc = [t.strip() for t in exclude_tags.split(",") if t.strip()]
-        R = R[~R["tags"].fillna("").apply(lambda s: any(t in s for t in exc))]
+        exc = [t.strip().lower() for t in exclude_tags.split(",") if t.strip()]
+        R = R[
+            ~R.apply(
+                lambda r: any(
+                    row_has_token(r.get("tags", ""), t) or desc_has_keyword(r.get("Desc", ""), t)
+                    for t in exc
+                ),
+                axis=1,
+            )
+        ]
+
+    # (existing de-dupe/ranking)
     R["dedup_key"] = R["Desc"].map(_normalize_desc)
-    R = R.sort_values(["score", "kcal_per_100g"], ascending=[True, True]).drop_duplicates("dedup_key", keep="first")
+    R = R.sort_values(["score", "kcal_per_100g"], ascending=[True, True])
+    R = R.drop_duplicates(subset="dedup_key", keep="first").drop(columns=["dedup_key"])
     return R.reset_index(drop=True)
+
 
 # =============================================================================
 # PDF → labs → sanitize
@@ -804,12 +835,21 @@ else:
 
             impact_total = impact_total.add(pd.Series(imp.values, index=P.index), fill_value=0.0)
 
-            dfm = (R_all.set_index("FoodCode")
-                      .assign(pred=pred, impact=imp)
-                      .sort_values("impact", ascending=False)
-                      [["Desc","impact"]]
-                      .rename(columns={"impact":"impact_score"}))
-            per_marker_tables[mkey] = dfm.reset_index()
+             dfm = (
+                R_all.set_index("FoodCode")
+                    .assign(pred=pred, impact=imp)
+                    .sort_values("impact", ascending=False)
+                    [["Desc","impact"]]
+                    .rename(columns={"impact":"impact_score"})
+                    .reset_index()
+            )
+
+# dedupe within a marker card by normalized description
+            dfm["dedup_key"] = dfm["Desc"].map(_normalize_desc)
+            dfm = dfm.drop_duplicates("dedup_key", keep="first").drop(columns="dedup_key")
+
+            per_marker_tables[mkey] = dfm
+
 
     # 6) blend with BioAge score
     base = pd.to_numeric(R_all["score"], errors="coerce").astype(float)
@@ -830,32 +870,40 @@ else:
 # 8) Marker cards (from per-marker impacts, if any)
     st.subheader("Foods by marker (model-targeted)")
 
-    # Show higher-severity markers first, so their picks get priority in cross-card de-dupe
-    ordered_markers = sorted(
-        MARKER_MAP.keys(),
-        key=lambda k: sev.get(k, {}).get("severity", 0.0),
-        reverse=True
-    )
+    shown_keys = set()       # global dedupe across cards
+    cols = st.columns(2); i = 0
 
-    cols = st.columns(2)
-    i = 0
-    used_keys: set[str] = set()   # track normalized descs used on earlier cards
-
-    for mkey in ordered_markers:
-        meta = MARKER_MAP[mkey]
-        info = sev.get(mkey, {})
-        val = info.get("value"); status = info.get("status")
-        units = meta["units"]; label = meta["label"]
+    for mkey, meta in MARKER_MAP.items():
+        info  = sev.get(mkey, {})
+        val   = info.get("value")
+        status= info.get("status")
+        units = meta["units"]
+        label = meta["label"]
         glyph = "🔺" if status == "high" else ("🔻" if status == "low" else "✅")
 
-        # fetch the table we built during scoring
-        dfk = per_marker_tables.get(mkey)
-        if dfk is None or dfk.empty:
-            with cols[i % 2]:
-                with st.container():
-                    st.markdown(f"**{label}** — {glyph} {('%.2f' % val) if val is not None else '—'} {units}")
+        with cols[i % 2]:
+            with st.container():
+                st.markdown(f"**{label}** — {glyph} {('%.2f' % val) if val is not None else '—'} {units}")
+                dfk = per_marker_tables.get(mkey)
+                if dfk is None or dfk.empty:
                     st.caption("No model or no strong matches for this marker.")
-            i += 1
+                else:
+                    # drop rows already shown on earlier cards (by normalized description)
+                    dfk = dfk.copy()
+                    dfk["dedup_key"] = dfk["Desc"].map(_normalize_desc)
+                    dfk = dfk[~dfk["dedup_key"].isin(shown_keys)]
+                    dfk = dfk.drop_duplicates("dedup_key", keep="first").drop(columns="dedup_key")
+
+                    show = (dfk.sort_values("impact_score", ascending=False)
+                              .head(10)[["FoodCode","Desc","impact_score"]]
+                              .rename(columns={"impact_score":"impact"}))
+                    st.dataframe(show, use_container_width=True, hide_index=True)
+
+                    # remember what we used so later cards don’t repeat
+                    shown_keys.update(dfk["Desc"].map(_normalize_desc).head(10))
+
+        i += 1
+
             continue
 
     # 1) de-dupe within the card
