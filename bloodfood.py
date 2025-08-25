@@ -545,44 +545,31 @@ def compute_marker_severity(labs_row: pd.Series) -> dict:
 # ---------------- Per-food predictor ----------------
 @st.cache_data(show_spinner=False)
 def load_perfood_bundle():
-    """
-    Load the per-marker ML bundle from models/PerFood or models/Perfood:
-      - meta.json
-      - X_scaler.joblib
-      - *.joblib models
-    Returns dict or None.
-    """
-    # Compute paths locally (no reliance on external globals)
-    mdl_dir = root / "models" / "PerFood"
+    """Load the per-marker ML bundle from models/PerFood (or models/Perfood)."""
+    mdl_dir = (root / "models" / "PerFood")
     if not mdl_dir.exists():
-        mdl_dir = root / "models" / "Perfood"
+        mdl_dir = (root / "models" / "Perfood")
     if not mdl_dir.exists():
         return None
 
-    meta_path = mdl_dir / "meta.json"
-    scaler_path = mdl_dir / "X_scaler.joblib"
-
-    # meta
     meta = {}
+    meta_path = mdl_dir / "meta.json"
     if meta_path.exists():
         with contextlib.suppress(Exception):
-            with open(meta_path, "r") as f:
-                meta = json.load(f)
+            meta = json.load(open(meta_path))
 
-    # joblib loader
     try:
         from joblib import load as joblib_load
     except Exception:
         st.error("Missing dependency 'joblib'. Add it to requirements.txt.")
         return None
 
-    # scaler
     scaler = None
+    scaler_path = mdl_dir / "X_scaler.joblib"
     if scaler_path.exists():
         with contextlib.suppress(Exception):
             scaler = joblib_load(scaler_path)
 
-    # models (all *.joblib except the scaler)
     models = {}
     for p in mdl_dir.glob("*.joblib"):
         if p.name == "X_scaler.joblib":
@@ -594,6 +581,7 @@ def load_perfood_bundle():
         return None
 
     return {"dir": str(mdl_dir), "meta": meta, "scaler": scaler, "models": models}
+
 
 
     scal_path = mdl_dir / PERFOOD_SCALER
