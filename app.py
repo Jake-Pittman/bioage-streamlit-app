@@ -381,12 +381,29 @@ def coarse_category(desc: str, tags: str) -> str:
 
 def dedup_rank(df: pd.DataFrame, include_tags: str = "", exclude_tags: str = "") -> pd.DataFrame:
     R = df.copy()
+
+    def row_has_token(text: str, token: str) -> bool:
+        return token in (text or "").lower()
+
+    def desc_has_token(desc: str, token: str) -> bool:
+        return token in str(desc or "").lower()
+
     if include_tags.strip():
-        inc = [t.strip() for t in include_tags.split(",") if t.strip()]
-        R = R[R["tags"].fillna("").apply(lambda s: any(t in s for t in inc))]
+        raw = [t.strip().lower() for t in include_tags.split(",") if t.strip()]
+        inc = []
+        for t in raw:
+            inc.extend(_DISLIKE_SYNONYMS.get(t, [t]))
+        R = R[R.apply(lambda r: any(row_has_token(r.get("tags",""), t) or
+                                    desc_has_token(r.get("Desc",""), t)
+                                    for t in inc), axis=1)]
     if exclude_tags.strip():
-        exc = [t.strip() for t in exclude_tags.split(",") if t.strip()]
-        R = R[~R["tags"].fillna("").apply(lambda s: any(t in s for t in exc))]
+        raw = [t.strip().lower() for t in exclude_tags.split(",") if t.strip()]
+        exc = []
+        for t in raw:
+            exc.extend(_DISLIKE_SYNONYMS.get(t, [t]))
+        R = R[~R.apply(lambda r: any(row_has_token(r.get("tags",""), t) or
+                                     desc_has_token(r.get("Desc",""), t)
+                                     for t in exc), axis=1)]
     R["dedup_key"] = R["Desc"].map(_normalize_desc)
     R = R.sort_values(["score", "kcal_per_100g"], ascending=[True, True])
     R = R.drop_duplicates(subset="dedup_key", keep="first")
@@ -543,6 +560,13 @@ _DIET_BLOCK = {
     # Mediterranean/DASH/Keto-lite handled as soft-goal nudges only
 }
 
+_DISLIKE_SYNONYMS = {
+    "fish": [
+        "fish","salmon","tuna","sardine","sardines","anchovy","anchovies",
+        "mackerel","herring","trout","cod","halibut","tilapia","seafood"
+    ]
+}
+
 def apply_preferences(df: pd.DataFrame,
                       diet_pattern: str,
                       exclusions: list[str],
@@ -571,9 +595,13 @@ def apply_preferences(df: pd.DataFrame,
 
     # Dislikes
     if dislikes.strip():
-        bads = [re.escape(x.strip()) for x in dislikes.split(",") if x.strip()]
-        if bads:
-            bad_re = re.compile(r"(" + "|".join(bads) + r")", re.I)
+        raw = [x.strip().lower() for x in dislikes.split(",") if x.strip()]
+        tokens = []
+        for t in raw:
+            tokens.extend(_DISLIKE_SYNONYMS.get(t, [t]))
+        if tokens:
+            bads = [re.escape(x) for x in tokens]
+            bad_re = re.compile(r"(?:" + "|".join(bads) + r")", re.I)
             R = R[~desc.str.contains(bad_re)]
 
     # Initialize the output score
