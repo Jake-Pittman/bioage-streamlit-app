@@ -353,6 +353,15 @@ def _normalize_desc(desc: str) -> str:
     s = s.replace("water cress", "watercress").replace("beet green", "beet greens").replace("turnip green", "turnip greens")
     return s
 
+
+def _dedupe_by_desc(df: pd.DataFrame) -> pd.DataFrame:
+    if "Desc" not in df.columns:
+        return df
+    df = df.copy()
+    df["dedup_key"] = df["Desc"].map(_normalize_desc)
+    df = df.drop_duplicates("dedup_key", keep="first").drop(columns="dedup_key")
+    return df
+
 _VEG_RE   = re.compile(r"\b(kale|chard|lettuce|greens?|watercress|parsley|basil|cilantro|spinach|broccoli|cabbage|cauliflower|asparagus|zucchini|squash|okra|tomato|mushroom|onion|pepper|beet|cucumber|pickle|radish|artichoke|brussels|celery|collards|mustard greens|turnip greens)\b", re.I)
 _FRUIT_RE = re.compile(r"\b(apple|banana|orange|berry|berries|strawberry|blueberry|raspberry|blackberry|grape|pear|peach|plum|cherry|pineapple|mango|papaya|melon|watermelon|cantaloupe|honeydew|kiwi|lemon|lime|grapefruit|pomegranate|date|fig|raisin|prune|avocado)\b", re.I)
 _LEG_RE   = re.compile(r"\b(bean|lentil|chickpea|pea|soy|tofu|tempeh|edamame|peanut|hummus|bread|rice|pasta|noodle|oat|oatmeal|barley|quinoa|corn|tortilla|wheat|bran|cereal|bulgur|couscous|polenta)\b", re.I)
@@ -406,7 +415,7 @@ def dedup_rank(df: pd.DataFrame, include_tags: str = "", exclude_tags: str = "")
                                      for t in exc), axis=1)]
     R["dedup_key"] = R["Desc"].map(_normalize_desc)
     R = R.sort_values(["score", "kcal_per_100g"], ascending=[True, True])
-    R = R.drop_duplicates(subset="dedup_key", keep="first")
+    R = R.drop_duplicates(subset="dedup_key", keep="first").drop(columns=["dedup_key"])
     return R.reset_index(drop=True)
 
 # ---------------- Attribution + personalization ----------------
@@ -1022,6 +1031,7 @@ else:
 
     # 4) Sort and show
     R_all = R_all.sort_values("score_use", ascending=True).reset_index(drop=True)
+    R_all = _dedupe_by_desc(R_all)
 
     top_overall = R_all.head(100).copy()
     st.markdown("**Top 100 overall (personalized — lower is better)**")
