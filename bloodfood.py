@@ -641,33 +641,6 @@ def build_feature_matrix(food_df: pd.DataFrame,
             X[feat] = base.set_index("FoodCode").reindex(X.index)[col].astype(float)
     return X
 
-# robust mapping from model filenames → NHANES codes
-_MODEL_ALIAS_TO_CODE = {
-    "LBXSGL":"LBXSGL","GLUCOSE":"LBXSGL","GLU":"LBXSGL",
-    "LBXCRP":"LBXCRP","CRP":"LBXCRP","HSCRP":"LBXCRP",
-    "LBXSAL":"LBXSAL","ALBUMIN":"LBXSAL","ALB":"LBXSAL",
-    "LBXSCR":"LBXSCR","CREATININE":"LBXSCR","CREAT":"LBXSCR","CREA":"LBXSCR",
-    "LBXWBCSI":"LBXWBCSI","WBC":"LBXWBCSI",
-    "LBXRDW":"LBXRDW","RDW":"LBXRDW",
-    "LBXSAPSI":"LBXSAPSI","ALP":"LBXSAPSI","ALKPHOS":"LBXSAPSI","ALKALINEPHOSPHATASE":"LBXSAPSI",
-    "LBXMCVSI":"LBXMCVSI","MCV":"LBXMCVSI",
-}
-_KNOWN_CODES = list({v for v in _MODEL_ALIAS_TO_CODE.values()})
-
-def _stem_to_code(stem: str) -> str | None:
-    s = re.sub(r"[^A-Z0-9]+","", str(stem).upper())
-    # exact code inside the stem
-    for code in _KNOWN_CODES:
-        if code in s:
-            return code
-    # alias inside the stem
-    for alias, code in _MODEL_ALIAS_TO_CODE.items():
-        if alias in s:
-            return code
-    # last-token alias fallback
-    last = (str(stem).split("_")[-1]).upper()
-    return _MODEL_ALIAS_TO_CODE.get(last)
-
 def predict_targets(bundle: dict, X: pd.DataFrame) -> pd.DataFrame:
     """Apply scaler (features already aligned) + each target model. Columns named by NHANES code."""
     if X is None or X.empty or not bundle or not bundle.get("models"):
@@ -903,60 +876,12 @@ else:
             dfm["dedup_key"] = dfm["Desc"].map(_normalize_desc)
             dfm = dfm.drop_duplicates("dedup_key", keep="first").drop(columns="dedup_key")
             per_marker_tables[mkey] = dfm
-# <— end of loop/block
-
-
-        def _norm(s: str) -> str:
-            return re.sub(r"[^A-Z0-9]+","", str(s).upper())
-
-        col = None
-        if tgt in P.columns:
-            col = tgt
-        else:
-            nt = _norm(tgt)
-            for c in P.columns:
-                if nt in _norm(c):
-                    col = c
-                    break
-
-        if col is None:
-           # no matching model column
-
-        pred = P[col]
-
-
-        sev_w = sev.get(mkey, {}).get("severity", 0.0)
-        if sev_w <= 0 and mkey != "glucose":
-            sev_w = 0.1
-        conf = clip01((float(r2_map.get(tgt, 0.0)) - 0.10) / 0.20) if r2_map else 0.6
-        if conf <= 0:
-            continue
-
-        pred = P[tgt]
-        benefit = goal_benefit(pred, meta)
-        imp = sev_w * conf * benefit
-
-        impact_total = impact_total.add(pd.Series(imp.values, index=P.index), fill_value=0.0)
-
-        dfm = (
-            R_all.set_index("FoodCode")
-                 .assign(pred=pred, impact=imp)
-                 .sort_values("impact", ascending=False)
-                 [["Desc","impact"]]
-                 .rename(columns={"impact":"impact_score"})
-                 .reset_index()
-        )
-        dfm = _dedupe_by_desc(dfm)
-        per_marker_tables[mkey] = dfm
 
     # 6) blend with BioAge score
     base = pd.to_numeric(R_all["score"], errors="coerce").astype(float)
     base_z = robust_z(base)
     impact_vec = impact_total.reindex(food_index).fillna(0.0).to_numpy()
     R_all["score_final"] = w_bioage * base_z - w_marker * impact_vec
-
-
-    R_all["score_final"] = blended
 
     # 7) overall table
     top_overall = R_all.sort_values("score_final", ascending=True).head(100).copy()
