@@ -381,12 +381,29 @@ def coarse_category(desc: str, tags: str) -> str:
 
 def dedup_rank(df: pd.DataFrame, include_tags: str = "", exclude_tags: str = "") -> pd.DataFrame:
     R = df.copy()
+
+    def row_has_token(text: str, token: str) -> bool:
+        return token in (text or "").lower()
+
+    def desc_has_token(desc: str, token: str) -> bool:
+        return token in str(desc or "").lower()
+
     if include_tags.strip():
-        inc = [t.strip() for t in include_tags.split(",") if t.strip()]
-        R = R[R["tags"].fillna("").apply(lambda s: any(t in s for t in inc))]
+        raw = [t.strip().lower() for t in include_tags.split(",") if t.strip()]
+        inc = []
+        for t in raw:
+            inc.extend(_DISLIKE_SYNONYMS.get(t, [t]))
+        R = R[R.apply(lambda r: any(row_has_token(r.get("tags",""), t) or
+                                    desc_has_token(r.get("Desc",""), t)
+                                    for t in inc), axis=1)]
     if exclude_tags.strip():
-        exc = [t.strip() for t in exclude_tags.split(",") if t.strip()]
-        R = R[~R["tags"].fillna("").apply(lambda s: any(t in s for t in exc))]
+        raw = [t.strip().lower() for t in exclude_tags.split(",") if t.strip()]
+        exc = []
+        for t in raw:
+            exc.extend(_DISLIKE_SYNONYMS.get(t, [t]))
+        R = R[~R.apply(lambda r: any(row_has_token(r.get("tags",""), t) or
+                                     desc_has_token(r.get("Desc",""), t)
+                                     for t in exc), axis=1)]
     R["dedup_key"] = R["Desc"].map(_normalize_desc)
     R = R.sort_values(["score", "kcal_per_100g"], ascending=[True, True])
     R = R.drop_duplicates(subset="dedup_key", keep="first")
@@ -543,11 +560,21 @@ _DIET_BLOCK = {
     # Mediterranean/DASH/Keto-lite handled as soft-goal nudges only
 }
 
+_DISLIKE_SYNONYMS = {
+    "fish": [
+        "fish","salmon","tuna","sardine","sardines","anchovy","anchovies",
+        "mackerel","herring","trout","cod","halibut","tilapia","seafood"
+    ]
+}
+
 def apply_preferences(df: pd.DataFrame,
                       diet_pattern: str,
                       exclusions: list[str],
                       dislikes: str,
                       attr_csv: Path,
+                      g_min_sugar: float,
+                      g_min_sodium: float,
+                      g_pref_protein: float,
                       base_col="score_labs",
                       out_col="score_use") -> pd.DataFrame:
     """
@@ -557,6 +584,7 @@ def apply_preferences(df: pd.DataFrame,
     R = df.copy()
     # Hard filters
     desc = R["Desc"].fillna("").astype(str)
+    tags = R.get("tags", "").fillna("").astype(str)
 
     # Diet pattern blocks (only if pattern has hard rules)
     block_re = _DIET_BLOCK.get(diet_pattern)
@@ -567,14 +595,23 @@ def apply_preferences(df: pd.DataFrame,
     for ex in exclusions:
         ex_re = _EXCL_PATTERNS.get(ex)
         if ex_re is not None:
-            R = R[~desc.str.contains(ex_re)]
+            bad_mask = desc.str.contains(ex_re)
+            R = R[~bad_mask]
+            desc = R["Desc"].fillna("").astype(str)
+            tags = R.get("tags", "").fillna("").astype(str)
 
     # Dislikes
     if dislikes.strip():
-        bads = [re.escape(x.strip()) for x in dislikes.split(",") if x.strip()]
-        if bads:
-            bad_re = re.compile(r"(" + "|".join(bads) + r")", re.I)
-            R = R[~desc.str.contains(bad_re)]
+        raw = [x.strip().lower() for x in dislikes.split(",") if x.strip()]
+        tokens = []
+        for t in raw:
+            tokens.extend(_DISLIKE_SYNONYMS.get(t, [t]))
+        if tokens:
+            bads = [re.escape(x) for x in tokens]
+            bad_re = re.compile(r"(?:" + "|".join(bads) + r")", re.I)
+            mask_desc = desc.str.contains(bad_re)
+            mask_tags = tags.str.contains(bad_re)
+            R = R[~(mask_desc | mask_tags)]
 
     # Initialize the output score
     R[out_col] = R[base_col].astype(float)
@@ -989,6 +1026,7 @@ else:
     # 3) Apply preferences -> score_use
     R_all = apply_preferences(
         R_all, diet_pattern, exclusions, dislikes, ATTR_CSV,
+        g_min_sugar, g_min_sodium, g_pref_protein,
         base_col="score_labs", out_col="score_use"
     )
 
