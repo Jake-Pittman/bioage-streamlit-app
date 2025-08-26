@@ -835,7 +835,14 @@ def foods_by_marker(R: pd.DataFrame,
             )
         ).sort_values("impact_score", ascending=False)
 
-        rows_by_marker[key] = dfk[["FoodCode","Desc","score_use","impact_score","why_help","why_watch"]].head(top_k)
+        # Deduplicate by description and backfill with next best foods so each marker
+        # surfaces `top_k` unique recommendations.
+        dfk = _dedupe_by_desc(dfk)
+
+        rows_by_marker[key] = (
+            dfk[["FoodCode", "Desc", "score_use", "impact_score", "why_help", "why_watch"]]
+            .head(top_k)
+        )
 
     return rows_by_marker
 
