@@ -264,7 +264,7 @@ def dedup_rank(df: pd.DataFrame, include_tags: str = "", exclude_tags: str = "")
         return token in (row_text or "").lower()
 
     def desc_has_keyword(desc: str, token: str) -> bool:
-        return re.search(rf"\b{re.escape(token)}(es|s)?\b", str(desc or ""), re.I) is not None
+        return token in str(desc or "").lower()
 
     if include_tags.strip():
         inc = [t.strip().lower() for t in include_tags.split(",") if t.strip()]
@@ -854,7 +854,11 @@ else:
             sev_w = sev.get(mkey, {}).get("severity", 0.0)
             if sev_w <= 0 and mkey != "glucose":
                 sev_w = 0.1
-            conf = clip01((float(r2_map.get(tgt, r2_map.get(col, 0.0))) - 0.10) / 0.20) if r2_map else 0.6
+            if r2_map:
+                raw_conf = r2_map.get(tgt, r2_map.get(col))
+                conf = clip01((float(raw_conf) - 0.10) / 0.20) if raw_conf is not None else 0.6
+            else:
+                conf = 0.6
             if conf <= 0:
                 continue
 
