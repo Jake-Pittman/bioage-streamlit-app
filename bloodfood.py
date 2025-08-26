@@ -886,29 +886,29 @@ else:
         pred = P[col]
 
 
-            sev_w = sev.get(mkey, {}).get("severity", 0.0)
-            if sev_w <= 0 and mkey != "glucose":
-                sev_w = 0.1
-            conf = clip01((float(r2_map.get(tgt, 0.0)) - 0.10) / 0.20) if r2_map else 0.6
-            if conf <= 0:
-                continue
+        sev_w = sev.get(mkey, {}).get("severity", 0.0)
+        if sev_w <= 0 and mkey != "glucose":
+            sev_w = 0.1
+        conf = clip01((float(r2_map.get(tgt, 0.0)) - 0.10) / 0.20) if r2_map else 0.6
+        if conf <= 0:
+            continue
 
-            pred = P[tgt]
-            benefit = goal_benefit(pred, meta)
-            imp = sev_w * conf * benefit
+        pred = P[tgt]
+        benefit = goal_benefit(pred, meta)
+        imp = sev_w * conf * benefit
 
-            impact_total = impact_total.add(pd.Series(imp.values, index=P.index), fill_value=0.0)
+        impact_total = impact_total.add(pd.Series(imp.values, index=P.index), fill_value=0.0)
 
-            dfm = (
-                R_all.set_index("FoodCode")
-                     .assign(pred=pred, impact=imp)
-                     .sort_values("impact", ascending=False)
-                     [["Desc","impact"]]
-                     .rename(columns={"impact":"impact_score"})
-                     .reset_index()
-            )
-            dfm = _dedupe_by_desc(dfm)
-            per_marker_tables[mkey] = dfm
+        dfm = (
+            R_all.set_index("FoodCode")
+                 .assign(pred=pred, impact=imp)
+                 .sort_values("impact", ascending=False)
+                 [["Desc","impact"]]
+                 .rename(columns={"impact":"impact_score"})
+                 .reset_index()
+        )
+        dfm = _dedupe_by_desc(dfm)
+        per_marker_tables[mkey] = dfm
 
     # 6) blend with BioAge score
     base = pd.to_numeric(R_all["score"], errors="coerce").astype(float)
