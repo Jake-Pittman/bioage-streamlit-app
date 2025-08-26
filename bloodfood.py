@@ -1,10 +1,6 @@
-# bloodfood.py — Hybrid BioAge + Per-Marker ML food recommender
-# - Parses labs (PDF/CSV) → computes PhenoAge + per-marker severity
-# - Loads per-food LightGBM models (joblib) + scaler → predicts marker deltas per food
-# - Blends BioAge score with per-marker impact + dietary preferences
+# bloodfood.py — BioAge + Per-Marker ML food recommender (VC demo ready)
 
 from __future__ import annotations
-
 import os, re, io, json, contextlib
 from pathlib import Path
 import numpy as np
@@ -12,11 +8,10 @@ import pandas as pd
 import streamlit as st
 
 # -----------------------------------------------------------------------------
-# Page + Paths
+# Page + paths
 # -----------------------------------------------------------------------------
 st.set_page_config(page_title="Blood→Food: BioAge + Marker Recs", layout="wide")
-
-APP_BUILD = "bf-v2-clean"
+APP_BUILD = "bf-vc-demo-2025-08-25"
 st.sidebar.caption(f"Build: {APP_BUILD}")
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -30,10 +25,6 @@ CORE   = root / "models" / "RewardModel" / "core_scoring"
 FND_PARQUET    = PROC / "FNDDS_MASTER_PER100G.parquet"
 CAT_PARQUET    = ASSETS / "food_catalog.parquet"
 LAB_SCHEMA_JS  = ASSETS / "lab_schema.json"
-TEMPLATE_CSV   = ASSETS / "labs_upload_template.csv"
-CONSENSUS_CSV  = CORE / "consensus_food_scores.csv"
-GUARDRAILS_CSV = CORE / "core_food_scores_guardrails.csv"
-ATTR_CSV       = CORE / "core_food_attribution_top50_compact.csv"  # optional
 
 # -----------------------------------------------------------------------------
 # Optional dependency: pdfplumber
@@ -45,7 +36,7 @@ except Exception:
     HAS_PDFPLUMBER = False
 
 # -----------------------------------------------------------------------------
-# Small helpers
+# Helpers
 # -----------------------------------------------------------------------------
 def robust_z(x: pd.Series) -> pd.Series:
     x = pd.to_numeric(x, errors="coerce").astype(float)
@@ -58,6 +49,30 @@ def robust_z(x: pd.Series) -> pd.Series:
 
 def clip01(v): return float(np.clip(v, 0.0, 1.0))
 
+_STOPWORDS = re.compile(
+    r"\b(ns as to form|nsf|nfs|assume.*?|fat not added in cooking|no added fat|"
+    r"from (?:fresh|frozen|canned)|fresh|frozen|canned|raw|cooked|reconstituted|"
+    r"for use on a sandwich|reduced sodium|low(?:fat| sodium)|diet)\b", re.I
+)
+def _normalize_desc(desc: str) -> str:
+    s = str(desc or "").lower()
+    s = re.sub(r"\(.*?\)", " ", s)
+    s = _STOPWORDS.sub(" ", s)
+    s = s.replace("-", " ")
+    s = re.sub(r"[^a-z\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    s = (s.replace("water cress","watercress")
+           .replace("beet green","beet greens")
+           .replace("turnip green","turnip greens"))
+    return s
+
+def _dedupe_by_desc(df: pd.DataFrame) -> pd.DataFrame:
+    if "Desc" not in df.columns: return df
+    R = df.copy()
+    R["dedup_key"] = R["Desc"].map(_normalize_desc)
+    R = R.drop_duplicates("dedup_key", keep="first").drop(columns="dedup_key")
+    return R
+
 # -----------------------------------------------------------------------------
 # Loaders
 # -----------------------------------------------------------------------------
@@ -66,7 +81,6 @@ def load_lab_schema() -> dict:
     if LAB_SCHEMA_JS.exists():
         with open(LAB_SCHEMA_JS, "r") as f:
             return json.load(f)
-    # minimal fallback schema (units for display/CSV aliasing)
     return {
         "age_years":{"unit":"years","aliases":["age","age_yrs"]},
         "albumin":{"unit":"g/dL","aliases":["LBXSAL","albumin"]},
@@ -88,27 +102,24 @@ def load_catalog() -> pd.DataFrame | None:
     cat["FoodCode"] = pd.to_numeric(cat["FoodCode"], errors="coerce").astype("Int64")
     if "tags" not in cat.columns:
         cat["tags"] = np.nan
-    # Ensure a score column exists
-    if "score" not in cat.columns:
-        cat["score"] = 0.0
     return cat
 
 @st.cache_data(show_spinner=False)
 def load_fnd_features() -> pd.DataFrame | None:
-    """Return FoodCode + NUTR_* features (prefer processed/FNDDS parquet)."""
+    # Prefer processed parquet with NUTR_* columns
     if FND_PARQUET.exists():
         fnd = pd.read_parquet(FND_PARQUET)
         fnd["FoodCode"] = pd.to_numeric(fnd["FoodCode"], errors="coerce").astype("Int64")
-        nutr_cols = [c for c in fnd.columns if str(c).startswith("NUTR_")]
-        return fnd[["FoodCode"] + nutr_cols].copy() if nutr_cols else None
+        nutr = [c for c in fnd.columns if str(c).startswith("NUTR_")]
+        return fnd[["FoodCode"] + nutr] if nutr else None
+    # Fallback: if catalog already carries NUTR_* columns
     if CAT_PARQUET.exists():
         c = pd.read_parquet(CAT_PARQUET)
         c["FoodCode"] = pd.to_numeric(c["FoodCode"], errors="coerce").astype("Int64")
-        nutr_cols = [c for c in c.columns if str(c).startswith("NUTR_")]
-        return c[["FoodCode"] + nutr_cols].copy() if nutr_cols else None
+        nutr = [x for x in c.columns if str(x).startswith("NUTR_")]
+        return c[["FoodCode"] + nutr] if nutr else None
     return None
 
-# CSV normalizer for fallback CSV uploads
 def normalize_labs(df_in: pd.DataFrame, schema: dict) -> pd.DataFrame:
     df = df_in.copy()
     alias_map = {a.lower(): std for std, meta in schema.items() for a in meta.get("aliases", [])}
@@ -116,9 +127,9 @@ def normalize_labs(df_in: pd.DataFrame, schema: dict) -> pd.DataFrame:
     if rename:
         df = df.rename(columns=rename)
     keep = list(schema.keys())
-    cols_present = [c for c in keep if c in df.columns]
-    out = df[cols_present].copy()
-    for c in cols_present:
+    present = [c for c in keep if c in df.columns]
+    out = df[present].copy()
+    for c in present:
         out[c] = pd.to_numeric(out[c], errors="coerce")
     return out
 
@@ -126,14 +137,9 @@ def normalize_labs(df_in: pd.DataFrame, schema: dict) -> pd.DataFrame:
 # PhenoAge (Levine)
 # -----------------------------------------------------------------------------
 def phenoage_from_row(row: pd.Series):
-    """
-    Inputs (clinical units): albumin g/dL, creat mg/dL, glucose mg/dL, CRP mg/L,
-    lymphocyte %, MCV fL, RDW %, ALP U/L, WBC 10^3/µL, age years
-    """
     need = ["age_years","albumin","creatinine","glucose","crp_mgL",
             "lymphocyte_pct","mcv","rdw","alk_phosphatase","wbc"]
-    if any(pd.isna(row.get(k)) for k in need):
-        return (None, None)
+    if any(pd.isna(row.get(k)) for k in need): return (None, None)
 
     albumin_gL   = float(row["albumin"]) * 10.0
     creat_umol   = float(row["creatinine"]) * 88.4
@@ -146,55 +152,44 @@ def phenoage_from_row(row: pd.Series):
     wbc          = float(row["wbc"])
     age          = float(row["age_years"])
 
-    xb = (
-        -19.90667
-        + (-0.03359355 * albumin_gL)
-        + ( 0.009506491 * creat_umol)
-        + ( 0.1953192  * glucose_mmol)
-        + ( 0.09536762 * lncrp)
-        + (-0.01199984 * lymph)
-        + ( 0.02676401 * mcv)
-        + ( 0.3306156  * rdw)
-        + ( 0.001868778* alp)
-        + ( 0.05542406 * wbc)
-        + ( 0.08035356 * age)
-    )
-    m = 1.0 - np.exp( (-1.51714 * np.exp(xb)) / 0.007692696 )
+    xb = (-19.90667
+          + (-0.03359355 * albumin_gL)
+          + ( 0.009506491 * creat_umol)
+          + ( 0.1953192  * glucose_mmol)
+          + ( 0.09536762 * lncrp)
+          + (-0.01199984 * lymph)
+          + ( 0.02676401 * mcv)
+          + ( 0.3306156  * rdw)
+          + ( 0.001868778* alp)
+          + ( 0.05542406 * wbc)
+          + ( 0.08035356 * age))
+    m = 1.0 - np.exp((-1.51714 * np.exp(xb)) / 0.007692696)
     m = float(np.clip(m, 1e-15, 1 - 1e-15))
     pheno = (np.log(-0.0055305 * np.log(1.0 - m)) / 0.09165) + 141.50225
     accel = pheno - age
     return float(np.clip(pheno, 0.0, 140.0)), float(np.clip(accel, -60.0, 90.0))
 
 # -----------------------------------------------------------------------------
-# Food catalog helpers
+# Catalog helpers (category + filters)
 # -----------------------------------------------------------------------------
-_STOPWORDS = re.compile(
-    r"\b(ns as to form|nsf|nfs|assume.*?|fat not added in cooking|no added fat|"
-    r"from (?:fresh|frozen|canned)|fresh|frozen|canned|raw|cooked|reconstituted|"
-    r"for use on a sandwich|reduced sodium|low(?:fat| sodium)|diet)\b", re.I
-)
-def _normalize_desc(desc: str) -> str:
-    s = str(desc or "").lower()
-    s = re.sub(r"\(.*?\)", " ", s)
-    s = _STOPWORDS.sub(" ", s)
-    s = s.replace("-", " ")
-    s = re.sub(r"[^a-z\s]", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    s = s.replace("water cress", "watercress").replace("beet green", "beet greens").replace("turnip green", "turnip greens")
-    return s
-
 _VEG_RE   = re.compile(r"\b(kale|chard|lettuce|greens?|watercress|parsley|basil|cilantro|spinach|broccoli|cabbage|cauliflower|asparagus|zucchini|squash|okra|tomato|mushroom|onion|pepper|beet|cucumber|pickle|radish|artichoke|brussels|celery|collards|mustard greens|turnip greens)\b", re.I)
 _FRUIT_RE = re.compile(r"\b(apple|banana|orange|berry|berries|strawberry|blueberry|raspberry|blackberry|grape|pear|peach|plum|cherry|pineapple|mango|papaya|melon|watermelon|cantaloupe|honeydew|kiwi|lemon|lime|grapefruit|pomegranate|date|fig|raisin|prune|avocado)\b", re.I)
 _LEG_RE   = re.compile(r"\b(bean|lentil|chickpea|pea|soy|tofu|tempeh|edamame|peanut|hummus|bread|rice|pasta|noodle|oat|oatmeal|barley|quinoa|corn|tortilla|wheat|bran|cereal|bulgur|couscous|polenta)\b", re.I)
 _PROT_RE  = re.compile(r"\b(beef|steak|veal|lamb|pork|bacon|sausage|ham|chicken|turkey|duck|"
-                       r"fish|seafood|salmon|tuna|sardine|sardines|anchovy|anchovies|mackerel|herring|trout|cod|halibut|tilapia|"
+                       r"fish|seafood|salmon|tuna|sardine|anchovy|mackerel|herring|trout|cod|halibut|tilapia|"
                        r"shrimp|prawn|oyster|clam|scallop|crab|lobster|egg|eggs|cheese|yogurt|kefir|milk|cottage cheese)\b", re.I)
-_FAT_RE   = re.compile(r"\b(oil|olive oil|canola|avocado oil|sunflower oil|safflower|sesame oil|peanut oil|coconut oil|"
-                       r"butter|ghee|margarine|shortening|lard|mayonnaise|mayo|aioli|tahini|"
-                       r"nut butter|peanut butter|almond butter|cashew butter|seed butter|tallow|"
-                       r"walnut|walnuts|almond|almonds|pecan|pecans|cashew|cashews|pistachio|pistachios|hazelnut|hazelnuts|"
-                       r"macadamia|sunflower seed|sunflower seeds|pumpkin seed|pumpkin seeds|flaxseed|chia|sesame seed|sesame seeds)\b", re.I)
+_FAT_RE   = re.compile(r"\b(avocado|olive|olive oil|canola|sunflower|safflower|sesame|peanut oil|coconut oil|"
+                       r"butter|ghee|margarine|shortening|lard|mayonnaise|tahini|"
+                       r"nut butter|walnut|almond|pecan|cashew|pistachio|hazelnut|macadamia|"
+                       r"sunflower seeds?|pumpkin seeds?|flaxseed|chia|sesame seeds?)\b", re.I)
 _BEV_RE   = re.compile(r"\b(almond milk|soy milk|oat milk|rice milk|coconut milk|hemp milk|cashew milk)\b", re.I)
+
+# ultra/recipe-ish phrases we avoid for "whole foods only"
+_ULTRA_RE = re.compile(
+    r"(made with|with (?:margarine|mayonnaise|oil|sauce|dressing|gravy)|"
+    r"in (?:sauce|gravy|broth)|breaded|battered|fried|salad|soup|sandwich|casserole|"
+    r"cookie|cake|pie|pizza|burger|noodles|pasta with|mix|instant|powder|cereal)", re.I
+)
 
 def coarse_category(desc: str, tags: str) -> str:
     t = (tags or "")
@@ -209,91 +204,117 @@ def coarse_category(desc: str, tags: str) -> str:
     if _LEG_RE.search(s):  return "legume_grains"
     return "other"
 
-def dedup_rank(df: pd.DataFrame, include_tags: str = "", exclude_tags: str = "") -> pd.DataFrame:
-    """De-dupe by description; include/exclude work on tags OR fallback to keywords in Desc."""
+def _desc_has_keyword(desc: str, token: str) -> bool:
+    return re.search(rf"\b{re.escape(token)}(es|s)?\b", str(desc or ""), re.I) is not None
+
+def _expand_dislikes(tokens: list[str]) -> list[str]:
+    tokens = [t.lower() for t in tokens]
+    expanded = set(tokens)
+    if "fish" in expanded:
+        expanded |= {
+            "fish","seafood","salmon","tuna","cod","sardine","mackerel","anchovy","herring",
+            "trout","halibut","tilapia","flounder","snapper","mahi","swordfish","pollock",
+            "haddock","catfish","whitefish"
+        }
+    if "shellfish" in expanded:
+        expanded |= {"shrimp","prawn","crab","lobster","clam","oyster","scallop","mussel"}
+    return list(expanded)
+
+def dedup_rank(df: pd.DataFrame, include_tags: str = "", exclude_tags: str = "", whole_only: bool = True) -> pd.DataFrame:
     R = df.copy()
 
-    def row_has_token(row_text: str, token: str) -> bool:
-        return token in (row_text or "").lower()
-
-    def desc_has_keyword(desc: str, token: str) -> bool:
-        return re.search(rf"\b{re.escape(token)}(es|s)?\b", str(desc or ""), re.I) is not None
-
-    # Include filter: tags OR Desc keywords
+    # Include by tags OR description keyword
     if include_tags.strip():
         inc = [t.strip().lower() for t in include_tags.split(",") if t.strip()]
-        R = R[
-            R.apply(
-                lambda r: any(
-                    row_has_token(r.get("tags", ""), t) or desc_has_keyword(r.get("Desc", ""), t)
-                    for t in inc
-                ),
-                axis=1,
-            )
-        ]
+        R = R[R.apply(lambda r: any(((t in str(r.get("tags","")).lower()) or _desc_has_keyword(r.get("Desc",""), t)) for t in inc), axis=1)]
 
-    # Exclude filter: tags OR Desc keywords
+    # Exclude by tags OR description keyword
     if exclude_tags.strip():
         exc = [t.strip().lower() for t in exclude_tags.split(",") if t.strip()]
-        R = R[
-            ~R.apply(
-                lambda r: any(
-                    row_has_token(r.get("tags", ""), t) or desc_has_keyword(r.get("Desc", ""), t)
-                    for t in exc
-                ),
-                axis=1,
-            )
-        ]
+        R = R[~R.apply(lambda r: any(((t in str(r.get("tags","")).lower()) or _desc_has_keyword(r.get("Desc",""), t)) for t in exc), axis=1)]
 
+    # De-dupe by normalized description, best (lowest) score wins
     R["dedup_key"] = R["Desc"].map(_normalize_desc)
-    R = R.sort_values(["score", "kcal_per_100g"], ascending=[True, True])
-    R = R.drop_duplicates(subset="dedup_key", keep="first").drop(columns=["dedup_key"])
-    return R.reset_index(drop=True)
+    R = R.sort_values(["score", "kcal_per_100g"], ascending=[True, True]).drop_duplicates("dedup_key", keep="first")
+    R = R.drop(columns="dedup_key").reset_index(drop=True)
+
+    if whole_only:
+        # Remove ultra/recipe-like rows
+        mask = ~R["Desc"].astype(str).str.contains(_ULTRA_RE)
+        # Also drop cereal_fortified if present
+        mask &= ~R["tags"].fillna("").str.contains("cereal_fortified")
+        R = R[mask].reset_index(drop=True)
+
+    return R
+
+_EXCL_PATTERNS = {
+    "dairy-free":      re.compile(r"\b(milk|cheese|yogurt|kefir|cream|butter|whey|casein|ghee|custard|ice cream)\b", re.I),
+    "gluten-free":     re.compile(r"\b(wheat|barley|rye|farro|couscous|bulgur|seitan)\b", re.I),
+    "nut-free":        re.compile(r"\b(almond|walnut|pecan|hazelnut|pistachio|cashew|macadamia)\b", re.I),
+    "shellfish-free":  re.compile(r"\b(shrimp|prawn|crab|lobster|oyster|clam|scallop|mussel)\b", re.I),
+    "egg-free":        re.compile(r"\b(egg|eggs)\b", re.I),
+    "soy-free":        re.compile(r"\b(soy|soya|tofu|tempeh|edamame|soybean)\b", re.I),
+    "pork-free":       re.compile(r"\b(pork|ham|bacon)\b", re.I),
+}
+def apply_hard_filters(df: pd.DataFrame, diet_pattern: str, exclusions: list[str], dislikes: str) -> pd.DataFrame:
+    R = df.copy()
+    desc = R["Desc"].fillna("").astype(str)
+    # Diet patterns
+    _DIET_BLOCK = {
+        "Vegan":        re.compile(r"\b(beef|pork|chicken|turkey|lamb|veal|fish|salmon|tuna|shrimp|oyster|clam|crab|lobster|egg|milk|cheese|yogurt|kefir)\b", re.I),
+        "Vegetarian":   re.compile(r"\b(beef|pork|chicken|turkey|lamb|veal|fish|salmon|tuna|shrimp|oyster|clam|crab|lobster)\b", re.I),
+        "Pescatarian":  re.compile(r"\b(beef|pork|chicken|turkey|lamb|veal)\b", re.I),
+    }
+    block_re = _DIET_BLOCK.get(diet_pattern)
+    if block_re is not None: R = R[~desc.str.contains(block_re)]
+
+    # Hard exclusions
+    for ex in exclusions:
+        ex_re = _EXCL_PATTERNS.get(ex)
+        if ex_re is not None:
+            R = R[~R["Desc"].astype(str).str.contains(ex_re)]
+
+    # Dislikes (expanded)
+    if dislikes.strip():
+        raw = [t.strip() for t in dislikes.split(",") if t.strip()]
+        bads = _expand_dislikes(raw)
+        bad_re = re.compile(r"(" + "|".join(map(re.escape, bads)) + r")", re.I)
+        R = R[~R["Desc"].astype(str).str.contains(bad_re)]
+
+    return R
 
 # -----------------------------------------------------------------------------
 # PDF → labs → sanitize
 # -----------------------------------------------------------------------------
 def parse_pdf_labs(file_like) -> dict:
-    """
-    Extract raw labs from a PDF. Tries tables first, then text; handles common unit quirks.
-    Keys returned when found: albumin, creatinine, (fasting_)glucose, crp, wbc, lymphs or lymphs_abs, mcv, rdw, alp
-    """
     if not HAS_PDFPLUMBER:
         raise RuntimeError("pdfplumber not installed. Run: pip install pdfplumber")
 
-    # label synonyms (longest-first wins)
     synonyms = [
-        # Albumin
-        ("serum albumin", "albumin"), ("albumin, serum", "albumin"),
-        ("albumin (serum)", "albumin"), ("alb", "albumin"), ("albumin", "albumin"),
-        # Alkaline phosphatase
-        ("alkaline phosphatase (total)", "alp"), ("alkaline phosphatase, total", "alp"),
-        ("alkaline phosphatase (alp)", "alp"), ("alkaline phosphatase (alk phos)", "alp"),
-        ("alk phosphatase", "alp"), ("alk. phosphatase", "alp"), ("alk phos", "alp"), ("alk-phos", "alp"),
-        ("alkaline phosphatase", "alp"), ("alkaline phosphate", "alp"), ("alp", "alp"),
-        # CRP
-        ("c-reactive protein, cardiac", "crp"), ("c-reactive protein (cardiac)", "crp"),
-        ("c reactive protein, cardiac", "crp"), ("crp, cardiac", "crp"),
-        ("high sensitivity crp", "crp"), ("hs-crp", "crp"), ("hscrp", "crp"),
-        ("c-reactive protein", "crp"), ("c reactive protein", "crp"), ("crp", "crp"),
-        # Glucose
-        ("glucose, fasting", "fasting_glucose"), ("glucose (fasting)", "fasting_glucose"),
-        ("fasting glucose", "fasting_glucose"), ("glucose fasting", "fasting_glucose"), ("glucose", "fasting_glucose"),
-        # WBC
-        ("white blood cell count", "wbc"), ("white blood cells", "wbc"),
-        ("white blood cell", "wbc"), ("wbc", "wbc"),
-        # Lymphocytes
-        ("lymphocytes absolute", "lymphs_abs"), ("absolute lymphocytes", "lymphs_abs"),
-        ("abs lymphocytes", "lymphs_abs"), ("lymphs #", "lymphs_abs"),
-        ("lymphocyte percent", "lymphs_pct"), ("lymphocytes percent", "lymphs_pct"),
-        ("lymphocyte %", "lymphs_pct"), ("lymphocytes %", "lymphs_pct"),
-        ("lymphocytes", "lymphs_pct"), ("lymphs", "lymphs_pct"),
-        # RBC indices
-        ("mean corpuscular volume", "mcv"), ("mcv", "mcv"),
-        ("red cell distribution width", "rdw"), ("rdw", "rdw"),
-        # Extras
-        ("creatinine", "creatinine"), ("creat", "creatinine"),
-        ("blood urea nitrogen", "bun"), ("bun", "bun"),
+        ("serum albumin","albumin"), ("albumin, serum","albumin"), ("albumin (serum)","albumin"),
+        ("alb","albumin"), ("albumin","albumin"),
+        ("alkaline phosphatase (total)","alp"), ("alkaline phosphatase, total","alp"),
+        ("alkaline phosphatase (alp)","alp"), ("alkaline phosphatase (alk phos)","alp"),
+        ("alk phosphatase","alp"), ("alk. phosphatase","alp"), ("alk phos","alp"),
+        ("alkaline phosphatase","alp"), ("alkaline phosphate","alp"), ("alp","alp"),
+        ("c-reactive protein, cardiac","crp"), ("c-reactive protein (cardiac)","crp"),
+        ("c reactive protein, cardiac","crp"), ("crp, cardiac","crp"),
+        ("high sensitivity crp","crp"), ("hs-crp","crp"), ("hscrp","crp"),
+        ("c-reactive protein","crp"), ("c reactive protein","crp"), ("crp","crp"),
+        ("glucose, fasting","fasting_glucose"), ("glucose (fasting)","fasting_glucose"),
+        ("fasting glucose","fasting_glucose"), ("glucose fasting","fasting_glucose"),
+        ("glucose","fasting_glucose"),
+        ("white blood cell count","wbc"), ("white blood cells","wbc"),
+        ("white blood cell","wbc"), ("wbc","wbc"),
+        ("lymphocytes absolute","lymphs_abs"), ("absolute lymphocytes","lymphs_abs"),
+        ("abs lymphocytes","lymphs_abs"), ("lymphs #","lymphs_abs"),
+        ("lymphocyte percent","lymphs_pct"), ("lymphocytes percent","lymphs_pct"),
+        ("lymphocyte %","lymphs_pct"), ("lymphocytes %","lymphs_pct"),
+        ("lymphocytes","lymphs_pct"), ("lymphs","lymphs_pct"),
+        ("mean corpuscular volume","mcv"), ("mcv","mcv"),
+        ("red cell distribution width","rdw"), ("rdw","rdw"),
+        ("creatinine","creatinine"), ("creat","creatinine"),
+        ("blood urea nitrogen","bun"), ("bun","bun"),
     ]
 
     range_pat   = re.compile(r"\b\d+(?:\.\d+)?\s*[-–]\s*\d+(?:\.\d+)?\b")
@@ -303,15 +324,13 @@ def parse_pdf_labs(file_like) -> dict:
     def match_key(lbl: str) -> str | None:
         s = (lbl or "").strip().lower()
         for name, key in sorted(synonyms, key=lambda kv: -len(kv[0])):
-            if name in s:
-                return key
+            if name in s: return key
         return None
 
     def first_numeric(txt: str, prefer_percent=False):
-        if not txt: return None, None
-        if range_pat.search(txt): return None, None
+        if not txt or range_pat.search(txt): return (None, None)
         m = number_pat.search(txt)
-        if not m: return None, None
+        if not m: return (None, None)
         val = float(m.group(1))
         has_pct = bool(percent_pat.search(txt))
         score = (1 if (prefer_percent and has_pct) else 0, -len(txt))
@@ -319,54 +338,41 @@ def parse_pdf_labs(file_like) -> dict:
 
     labs, aux, evidence = {}, {}, {}
 
-    # tables first
     with pdfplumber.open(file_like) as pdf:
         for page in pdf.pages:
             for tbl in (page.extract_tables() or []):
                 for r_i, row in enumerate(tbl or []):
-                    if not row or all(c is None or str(c).strip()=="" for c in row):
-                        continue
+                    if not row or all(c is None or str(c).strip()=="" for c in row): continue
                     label = str(row[0] or "")
                     key = match_key(label)
                     if not key: continue
 
                     prefer_pct = (key == "lymphs_pct")
-                    best = None  # (score, value, raw_text)
-
+                    best = None
                     for cell in row[1:]:
                         txt = str(cell or "")
                         val, score = first_numeric(txt, prefer_percent=prefer_pct)
                         if val is None: continue
                         cand = (score, val, txt)
-                        if (best is None) or (cand > best):
-                            best = cand
+                        if (best is None) or (cand > best): best = cand
 
                     if best is None and len(row) > 1 and r_i + 1 < len(tbl):
                         below = str((tbl[r_i+1] or [""])[1] or "")
                         val, score = first_numeric(below, prefer_percent=prefer_pct)
-                        if val is not None:
-                            best = (score, val, below)
+                        if val is not None: best = (score, val, below)
 
                     if best is None: continue
-
                     _, value, rawtxt = best
                     lowtxt = (rawtxt or "").lower()
 
-                    if key == "crp" and ("mg/dl" in lowtxt) and ("mg/l" not in lowtxt):
-                        value *= 10.0
-                    if key == "albumin" and "g/l" in lowtxt:
-                        value /= 10.0
+                    if key == "crp" and ("mg/dl" in lowtxt) and ("mg/l" not in lowtxt): value *= 10.0
+                    if key == "albumin" and "g/l" in lowtxt: value /= 10.0
 
-                    if key == "lymphs_abs":
-                        aux["lymphs_abs"] = value; evidence["lymphs_abs"] = (value, rawtxt)
-                    elif key == "lymphs_pct":
-                        aux["lymphs_pct"] = value; evidence["lymphs_pct"] = (value, rawtxt)
-                    elif key == "wbc":
-                        labs["wbc"] = value;    evidence["wbc"] = (value, rawtxt)
-                    else:
-                        labs[key] = value;      evidence[key] = (value, rawtxt)
+                    if key == "lymphs_abs": aux["lymphs_abs"] = value; evidence["lymphs_abs"] = (value, rawtxt)
+                    elif key == "lymphs_pct": aux["lymphs_pct"] = value; evidence["lymphs_pct"] = (value, rawtxt)
+                    elif key == "wbc": labs["wbc"] = value; evidence["wbc"] = (value, rawtxt)
+                    else: labs[key] = value; evidence[key] = (value, rawtxt)
 
-    # text fallback
     file_like.seek(0)
     full_text = ""
     with pdfplumber.open(file_like) as pdf:
@@ -383,14 +389,13 @@ def parse_pdf_labs(file_like) -> dict:
         if std_key == "crp" and ("mg/dl" in window) and ("mg/l" not in window): val *= 10.0
         if std_key == "albumin" and "g/l" in window: val /= 10.0
         if std_key in ("lymphs_pct","lymphs_abs"):
-            aux[std_key] = val;  evidence[std_key] = (val, window.strip())
+            aux[std_key] = val; evidence[std_key] = (val, window.strip())
         else:
             labs[std_key] = val; evidence[std_key] = (val, window.strip())
 
-    for label, key in synonyms:
-        from_text(label, key)
+    for label, key in synonyms: from_text(label, key)
 
-    # extra ALP fallbacks
+    # ALP fallbacks
     if "alp" not in labs:
         m = re.search(r"(?i)\bALP\b[^\n]{0,40}?(-?\d+(?:\.\d+)?)", full_text)
         if m:
@@ -404,16 +409,14 @@ def parse_pdf_labs(file_like) -> dict:
         if m:
             with contextlib.suppress(Exception): labs["alp"] = float(m.group(2))
 
-    # derive lymph %
+    # lymph % derivation
     if "lymphs_pct" in aux and "lymphs" not in labs:
         labs["lymphs"] = aux["lymphs_pct"]; evidence["lymphs"] = evidence.get("lymphs_pct", (labs["lymphs"], "% cell"))
     if ("lymphs" not in labs) and ("lymphs_abs" in aux) and ("wbc" in labs):
-        try:
+        with contextlib.suppress(Exception):
             abs_cells = float(aux["lymphs_abs"]); wbc_k = float(labs["wbc"])
             pct = (abs_cells / (wbc_k * 1000.0)) * 100.0
             labs["lymphs"] = pct; evidence["lymphs"] = (pct, f"derived from abs {aux['lymphs_abs']} and wbc {labs['wbc']}")
-        except Exception:
-            pass
 
     labs["_evidence"] = evidence
     return labs
@@ -421,39 +424,31 @@ def parse_pdf_labs(file_like) -> dict:
 def sanitize_labs(labs: dict) -> dict:
     x = dict(labs) if labs else {}
 
-    # WBC normalization
     if "wbc" in x and x["wbc"] is not None:
-        try:
+        with contextlib.suppress(Exception):
             w = float(x["wbc"])
             if w > 100: w = w / 1000.0
             x["wbc"] = float(np.clip(w, 0.1, 50.0))
-        except Exception:
-            pass
 
-    # Lymphs
     if x.get("lymphs") is None and x.get("lymphs_abs") is not None and x.get("wbc") not in (None, 0):
-        try:
+        with contextlib.suppress(Exception):
             abs_cells = float(x["lymphs_abs"]); wbc_k = float(x["wbc"])
             x["lymphs"] = (abs_cells / (wbc_k * 1000.0)) * 100.0
-        except Exception: pass
+
     if x.get("lymphs") is not None:
-        try:
+        with contextlib.suppress(Exception):
             l = float(x["lymphs"])
             if l > 1000 and x.get("wbc"):
                 l = (l / (float(x["wbc"]) * 1000.0)) * 100.0
             if l > 100: l = l/10.0 if l <= 300 else l/100.0
             x["lymphs"] = float(np.clip(l, 1.0, 80.0))
-        except Exception: pass
 
-    # CRP → mg/L
     if x.get("crp") is not None:
-        try:
+        with contextlib.suppress(Exception):
             c = float(x["crp"])
             if c > 200: c = c * 10.0
             x["crp"] = float(np.clip(c, 0.0, 500.0))
-        except Exception: pass
 
-    # Clamps
     def _clip(k, lo, hi):
         if x.get(k) is None: return
         with contextlib.suppress(Exception):
@@ -506,12 +501,12 @@ def compute_marker_severity(labs_row: pd.Series) -> dict:
 # Per-food predictor
 # -----------------------------------------------------------------------------
 @st.cache_data(show_spinner=False)
-def load_perfood_bundle(base_dir: Path | None = None):
+def load_perfood_bundle():
     """
-    Load per-marker ML bundle from models/PerFood (or models/Perfood).
-    Returns dict with: dir, meta, features, scaler, models, r2_map — or None.
+    Load models from models/PerFood (or models/Perfood).
+    Returns: {"dir","meta","features","scaler","models","r2_map"} or None
     """
-    base = Path(base_dir) if base_dir else (root / "models")
+    base = root / "models"
     mdl_dir = base / "PerFood"
     if not mdl_dir.exists():
         mdl_dir = base / "Perfood"
@@ -519,13 +514,12 @@ def load_perfood_bundle(base_dir: Path | None = None):
         st.warning(f"PerFood models folder not found under {base}.")
         return None
 
-    # meta.json (optional)
+    # meta.json
     meta = {}
     meta_path = mdl_dir / "meta.json"
     if meta_path.exists():
         with contextlib.suppress(Exception):
             meta = json.load(open(meta_path))
-    features = meta.get("features")
 
     # joblib
     try:
@@ -541,11 +535,10 @@ def load_perfood_bundle(base_dir: Path | None = None):
         with contextlib.suppress(Exception):
             scaler = joblib_load(scal_path)
 
-    # models (*.joblib except scaler)
+    # models
     models = {}
     for p in mdl_dir.glob("*.joblib"):
-        if p.name == "X_scaler.joblib":
-            continue
+        if p.name == "X_scaler.joblib": continue
         with contextlib.suppress(Exception):
             models[p.stem] = joblib_load(p)
 
@@ -553,13 +546,27 @@ def load_perfood_bundle(base_dir: Path | None = None):
         st.error(f"No *.joblib models found in {mdl_dir}.")
         return None
 
-    # per-target R² (optional)
+    # Infer feature names if meta doesn't provide them
+    features = meta.get("features") or meta.get("feature_names")
+    if not features:
+        for m in models.values():
+            names = None
+            with contextlib.suppress(Exception):
+                names = getattr(m, "feature_name_", None)
+            if names is None:
+                with contextlib.suppress(Exception):
+                    names = m.booster_.feature_name()
+            if names:
+                features = list(names)
+                break
+
+    # R^2 map (optional)
     r2_map = {}
-    r2_path = mdl_dir / "per_target_r2.csv"
-    if r2_path.exists():
+    r2_csv = mdl_dir / "per_target_r2.csv"
+    if r2_csv.exists():
         with contextlib.suppress(Exception):
-            r2df = pd.read_csv(r2_path)
-            if {"target", "r2"}.issubset(r2df.columns):
+            r2df = pd.read_csv(r2_csv)
+            if {"target","r2"}.issubset(r2df.columns):
                 r2_map = dict(zip(r2df["target"], r2df["r2"]))
 
     st.sidebar.caption(f"PerFood dir: {mdl_dir}")
@@ -567,25 +574,22 @@ def load_perfood_bundle(base_dir: Path | None = None):
             "scaler": scaler, "models": models, "r2_map": r2_map}
 
 def build_feature_matrix(food_df: pd.DataFrame, fnd_df: pd.DataFrame | None, required: list[str] | None) -> pd.DataFrame | None:
-    """Return DataFrame X with shape [n_foods, n_features] aligned to required features."""
     if required is None:
         src = fnd_df if (fnd_df is not None) else food_df
         cols = [c for c in src.columns if str(c).startswith("NUTR_")]
-        if not cols:
-            return None
+        if not cols: return None
         required = cols
     if fnd_df is not None and set(required).issubset(fnd_df.columns):
         X = food_df[["FoodCode"]].merge(fnd_df[["FoodCode"] + list(required)], on="FoodCode", how="left")
     else:
-        if not set(required).issubset(food_df.columns):
-            return None
+        if not set(required).issubset(food_df.columns): return None
         X = food_df[["FoodCode"] + list(required)].copy()
     for c in required:
         if c not in X.columns: X[c] = 0.0
     return X.set_index("FoodCode")[list(required)].astype(float)
 
 def predict_targets(bundle: dict, X: pd.DataFrame) -> pd.DataFrame:
-    """Apply scaler + each target model; return DF indexed by FoodCode with columns per target code."""
+    """Apply scaler + each model; return DF indexed by FoodCode with columns named by NHANES target code."""
     if X is None or X.empty or not bundle or not bundle.get("models"):
         return pd.DataFrame(index=X.index if X is not None else None)
 
@@ -597,49 +601,16 @@ def predict_targets(bundle: dict, X: pd.DataFrame) -> pd.DataFrame:
         Xs = X
 
     preds = {}
-    for tgt, mdl in bundle["models"].items():
+    for stem, mdl in bundle["models"].items():
+        # joblib names like "lgbm_LBXSGL" → "LBXSGL"
+        code = stem.split(".")[0]
+        code = code.split("_")[-1] if "_" in code else code
         try:
-            # Example filenames: lgbm_LBXSGL.joblib → column "LBXSGL"
-            tgt_code = Path(tgt).stem.split("_")[-1]
-            preds[tgt_code] = np.asarray(mdl.predict(Xs)).astype(float)
+            preds[code] = np.asarray(mdl.predict(Xs)).astype(float)
         except Exception:
             continue
 
-    if not preds:
-        return pd.DataFrame(index=X.index)
-    return pd.DataFrame(preds, index=X.index)
-
-# -----------------------------------------------------------------------------
-# Preference filters
-# -----------------------------------------------------------------------------
-_EXCL_PATTERNS = {
-    "dairy-free":      re.compile(r"\b(milk|cheese|yogurt|kefir|cream|butter|whey|casein|ghee|custard|ice cream)\b", re.I),
-    "gluten-free":     re.compile(r"\b(wheat|barley|rye|farro|couscous|bulgur|seitan)\b", re.I),
-    "nut-free":        re.compile(r"\b(almond|walnut|pecan|hazelnut|pistachio|cashew|macadamia)\b", re.I),
-    "shellfish-free":  re.compile(r"\b(shrimp|prawn|crab|lobster|oyster|clam|scallop|mussel)\b", re.I),
-    "egg-free":        re.compile(r"\b(egg|eggs)\b", re.I),
-    "soy-free":        re.compile(r"\b(soy|soya|tofu|tempeh|edamame|soybean)\b", re.I),
-    "pork-free":       re.compile(r"\b(pork|ham|bacon)\b", re.I),
-}
-_DIET_BLOCK = {
-    "Vegan":        re.compile(r"\b(beef|pork|chicken|turkey|lamb|veal|fish|salmon|tuna|shrimp|oyster|clam|crab|lobster|egg|milk|cheese|yogurt|kefir)\b", re.I),
-    "Vegetarian":   re.compile(r"\b(beef|pork|chicken|turkey|lamb|veal|fish|salmon|tuna|shrimp|oyster|clam|crab|lobster)\b", re.I),
-    "Pescatarian":  re.compile(r"\b(beef|pork|chicken|turkey|lamb|veal)\b", re.I),
-}
-def apply_hard_filters(df: pd.DataFrame, diet_pattern: str, exclusions: list[str], dislikes: str) -> pd.DataFrame:
-    R = df.copy()
-    desc = R["Desc"].fillna("").astype(str)
-    block_re = _DIET_BLOCK.get(diet_pattern)
-    if block_re is not None: R = R[~desc.str.contains(block_re)]
-    for ex in exclusions:
-        ex_re = _EXCL_PATTERNS.get(ex)
-        if ex_re is not None: R = R[~desc.str.contains(ex_re)]
-    if dislikes.strip():
-        bads = [re.escape(x.strip()) for x in dislikes.split(",") if x.strip()]
-        if bads:
-            bad_re = re.compile(r"(" + "|".join(bads) + r")", re.I)
-            R = R[~desc.str.contains(bad_re)]
-    return R
+    return pd.DataFrame(preds, index=X.index) if preds else pd.DataFrame(index=X.index)
 
 # -----------------------------------------------------------------------------
 # UI
@@ -649,8 +620,10 @@ st.title("Blood→Food: BioAge + Marker-Targeted Recommendations")
 with st.sidebar:
     st.markdown("**Paths**")
     st.text(f"Root: {root}")
+
     include_tags = st.text_input("Include tags/keywords (comma-separated)", value="")
     exclude_tags = st.text_input("Exclude tags/keywords (comma-separated)", value="")
+    whole_only   = st.checkbox("Whole foods only (recommended)", value=True)
 
     st.markdown("**Preferences**")
     diet_pattern = st.selectbox("Diet pattern", ["Omnivore","Pescatarian","Vegetarian","Vegan","Mediterranean","DASH","Keto-lite"], index=0)
@@ -672,6 +645,9 @@ schema   = load_lab_schema()
 catalog  = load_catalog()
 fnd_nutr = load_fnd_features()
 
+# -----------------------------------------------------------------------------
+# Parse labs + BioAge
+# -----------------------------------------------------------------------------
 parsed_df = None
 if run_clicked:
     labs_dict = {}
@@ -704,7 +680,6 @@ if run_clicked:
         }
         parsed_df = pd.DataFrame([mapped])
 
-# ---- Labs & BioAge
 st.subheader("Parsed labs & BioAge")
 def _have_all_needed_cols(df: pd.DataFrame) -> bool:
     need = ["age_years","albumin","creatinine","glucose","crp_mgL",
@@ -721,7 +696,9 @@ if isinstance(parsed_df, pd.DataFrame) and not parsed_df.empty and _have_all_nee
 else:
     st.info("Upload & run to parse labs and compute BioAge.")
 
-# ---- Recommendations
+# -----------------------------------------------------------------------------
+# Recommendations
+# -----------------------------------------------------------------------------
 st.subheader("Food recommendations")
 
 if parsed_df is None:
@@ -729,15 +706,14 @@ if parsed_df is None:
 elif catalog is None or catalog.empty:
     st.error("Food catalog not found (app_assets/food_catalog.parquet).")
 else:
-    # 1) Filter + de-dupe + category
-    R_all = dedup_rank(catalog, include_tags, exclude_tags).copy()
+    # 1) filter + de-dupe + category
+    R_all = dedup_rank(catalog, include_tags, exclude_tags, whole_only=whole_only).copy()
     R_all["category"] = [coarse_category(d, t) for d, t in zip(R_all["Desc"], R_all["tags"])]
-
-    # 2) Apply user hard filters
+    # 2) user hard filters
     R_all = apply_hard_filters(R_all, diet_pattern, exclusions, dislikes)
 
-    # 3) Per-food predictions
-    P = None
+    # 3) per-food predictions
+    P = pd.DataFrame()
     bundle = load_perfood_bundle()
     if bundle is None:
         st.warning("Per-marker ML bundle not found. Skipping per-marker recommendations.")
@@ -750,63 +726,55 @@ else:
             P = predict_targets(bundle, X)
             st.caption(f"Loaded PerFood models from: {bundle['dir']}")
 
-    # 4) Marker severity
+    # 4) marker severity
     sev = compute_marker_severity(parsed_df.iloc[0])
 
-    # 5) Marker impact from predictions
+    # 5) marker impact (only if we have predictions)
     impact_total = pd.Series(0.0, index=R_all["FoodCode"].astype("Int64"))
-    per_marker_tables = {}
+    per_marker_tables: dict[str, pd.DataFrame] = {}
 
-    if P is not None and not P.empty:
+    if not P.empty:
         def goal_benefit(pred: pd.Series, meta: dict) -> pd.Series:
-            med = np.nanmedian(pred); iqr = np.nanpercentile(pred, 75) - np.nanpercentile(pred, 25)
+            iqr = np.nanpercentile(pred, 75) - np.nanpercentile(pred, 25)
             sigma = iqr/1.349 if iqr and np.isfinite(iqr) and iqr>0 else np.nanstd(pred)
             sigma = sigma if sigma and np.isfinite(sigma) and sigma>0 else 1.0
             lo, hi = meta["goal"]
-            if meta["dir"] == "high":
-                b = (hi - pred) / sigma
-            else:
-                b = (pred - lo) / sigma
-            return b.clip(-3, 3)
+            return ((hi - pred)/sigma if meta["dir"]=="high" else (pred - lo)/sigma).clip(-3,3)
 
         r2_map = bundle.get("r2_map", {})
         for mkey, meta in MARKER_MAP.items():
             tgt = meta.get("target")
-            if not tgt or tgt not in P.columns:
+            if not tgt or tgt not in P.columns:  # skip if we don't have this model
                 continue
             sev_w = sev.get(mkey, {}).get("severity", 0.0)
-            if sev_w <= 0 and mkey != "glucose":
+            if sev_w <= 0 and mkey != "glucose":  # tiny diversity weight if inside goal
                 sev_w = 0.1
             conf = clip01((float(r2_map.get(tgt, 0.0)) - 0.10) / 0.20) if r2_map else 0.6
+            if conf <= 0: continue
 
             pred = P[tgt]
             benefit = goal_benefit(pred, meta)
             imp = sev_w * conf * benefit
 
-            # accumulate total impact
             impact_total = impact_total.add(pd.Series(imp.values, index=P.index), fill_value=0.0)
 
-            # build per-marker table
-            dfm = (
-                R_all.set_index("FoodCode")
-                    .assign(pred=pred, impact=imp)
-                    .sort_values("impact", ascending=False)
-                    [["Desc","impact"]]
-                    .rename(columns={"impact":"impact_score"})
-                    .reset_index()
-            )
-            # de-dupe within a card by normalized description
-            dfm["dedup_key"] = dfm["Desc"].map(_normalize_desc)
-            dfm = dfm.drop_duplicates("dedup_key", keep="first").drop(columns="dedup_key")
+            dfm = (R_all.set_index("FoodCode")
+                         .assign(pred=pred, impact=imp)
+                         .sort_values("impact", ascending=False)
+                         [["Desc","impact"]]
+                         .rename(columns={"impact":"impact_score"})
+                         .reset_index())
+
+            # de-dupe within the marker card
+            dfm = _dedupe_by_desc(dfm)
             per_marker_tables[mkey] = dfm
 
-    # 6) Blend with BioAge score
-    base = pd.to_numeric(R_all["score"], errors="coerce").astype(float)
-    base_z = robust_z(base)
-    impact_aligned = impact_total.reindex(R_all["FoodCode"].astype("Int64")).fillna(0.0).to_numpy()
-    R_all["score_final"] = w_bioage * base_z.to_numpy() - w_marker * impact_aligned
+    # 6) blend with BioAge score
+    base_z = robust_z(pd.to_numeric(R_all["score"], errors="coerce").astype(float))
+    blended = w_bioage * base_z - w_marker * impact_total.reindex(R_all["FoodCode"].astype("Int64")).fillna(0.0).values
+    R_all["score_final"] = blended
 
-    # 7) Overall table
+    # 7) overall table
     top_overall = R_all.sort_values("score_final", ascending=True).head(100).copy()
     st.markdown("**Top 100 overall (lower = better; blended BioAge + Marker)**")
     st.dataframe(
@@ -815,11 +783,11 @@ else:
         use_container_width=True
     )
 
-    # 8) Marker cards (with cross-card de-dupe)
+    # 8) marker cards (dedupe across cards so the same food doesn’t repeat)
     st.subheader("Foods by marker (model-targeted)")
-    shown_keys: set[str] = set()
-    cols = st.columns(2); i = 0
-
+    shown_keys = set()
+    cols = st.columns(2)
+    i = 0
     for mkey, meta in MARKER_MAP.items():
         info  = sev.get(mkey, {})
         val   = info.get("value")
@@ -829,28 +797,23 @@ else:
         glyph = "🔺" if status == "high" else ("🔻" if status == "low" else "✅")
 
         with cols[i % 2]:
-            with st.container():
-                st.markdown(f"**{label}** — {glyph} {('%.2f' % val) if val is not None else '—'} {units}")
-                dfk = per_marker_tables.get(mkey)
-                if dfk is None or dfk.empty:
-                    st.caption("No model or no strong matches for this marker.")
-                else:
-                    dfk = dfk.copy()
-                    dfk["dedup_key"] = dfk["Desc"].map(_normalize_desc)
-                    dfk = dfk[~dfk["dedup_key"].isin(shown_keys)]
-                    dfk = dfk.drop_duplicates("dedup_key", keep="first").drop(columns="dedup_key")
-
-                    show = (dfk.sort_values("impact_score", ascending=False)
-                              .head(10)[["FoodCode","Desc","impact_score"]]
-                              .rename(columns={"impact_score":"impact"}))
-                    st.dataframe(show, use_container_width=True, hide_index=True)
-
-                    # remember the ones we showed so later cards don’t repeat them
-                    shown_keys.update(dfk["Desc"].map(_normalize_desc).head(10))
-
+            st.markdown(f"**{label}** — {glyph} {('%.2f' % val) if val is not None else '—'} {units}")
+            dfk = per_marker_tables.get(mkey)
+            if dfk is None or dfk.empty:
+                st.caption("No model or no strong matches for this marker.")
+            else:
+                dfk = dfk.copy()
+                dfk["dedup_key"] = dfk["Desc"].map(_normalize_desc)
+                dfk = dfk[~dfk["dedup_key"].isin(shown_keys)]
+                dfk = dfk.drop_duplicates("dedup_key", keep="first").drop(columns="dedup_key")
+                show = (dfk.sort_values("impact_score", ascending=False)
+                          .head(10)[["FoodCode","Desc","impact_score"]]
+                          .rename(columns={"impact_score":"impact"}))
+                st.dataframe(show, use_container_width=True, hide_index=True)
+                shown_keys.update(show["Desc"].map(_normalize_desc))
         i += 1
 
-    # 9) Category tabs
+    # 9) category tabs
     st.subheader("Browse by category")
     tabs = st.tabs(["Protein","Fats","Fruit","Vegetables","Legume/Grains","Other"])
     CAT_ORDER = ["protein","fats","fruit","vegetables","legume_grains","other"]
