@@ -842,18 +842,17 @@ else:
             P = predict_targets(bundle, X)
             st.caption(f"Loaded PerFood models from: {bundle['dir']}")
 
-    # 4) marker severity
+    # 4) Marker severity
     sev = compute_marker_severity(parsed_df.iloc[0])
 
-    # 5) marker impact
-# Robust index for foods (works even if 'FoodCode' is missing)
-    if "FoodCode" in R_all.columns:
+    # 5) Marker impact setup (make a robust food index)
+    if "FoodCode" in R_all.columns and R_all["FoodCode"].notna().any():
         food_index = pd.to_numeric(R_all["FoodCode"], errors="coerce").astype("Int64")
     else:
+        # fallback if FoodCode missing
         food_index = pd.Series(R_all.index, dtype="Int64", name="FoodCode")
 
     impact_total = pd.Series(0.0, index=food_index)
-
     per_marker_tables = {}
 
     if P is not None and not P.empty:
@@ -953,7 +952,9 @@ else:
     # 6) blend with BioAge score
     base = pd.to_numeric(R_all["score"], errors="coerce").astype(float)
     base_z = robust_z(base)
-    blended = w_bioage * base_z - w_marker * impact_total.reindex(food_index).fillna(0.0).values
+    impact_vec = impact_total.reindex(food_index).fillna(0.0).to_numpy()
+    R_all["score_final"] = w_bioage * base_z - w_marker * impact_vec
+
 
     R_all["score_final"] = blended
 
