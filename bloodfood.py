@@ -847,63 +847,63 @@ else:
 
     # 5) marker impact
 # Robust index for foods (works even if 'FoodCode' is missing)
-if "FoodCode" in R_all.columns:
-    food_index = pd.to_numeric(R_all["FoodCode"], errors="coerce").astype("Int64")
-else:
-    food_index = pd.Series(R_all.index, dtype="Int64", name="FoodCode")
+    if "FoodCode" in R_all.columns:
+        food_index = pd.to_numeric(R_all["FoodCode"], errors="coerce").astype("Int64")
+    else:
+        food_index = pd.Series(R_all.index, dtype="Int64", name="FoodCode")
 
-impact_total = pd.Series(0.0, index=food_index)
+    impact_total = pd.Series(0.0, index=food_index)
 
-per_marker_tables = {}
+    per_marker_tables = {}
 
-if P is not None and not P.empty:
-    def goal_benefit(pred: pd.Series, meta: dict) -> pd.Series:
-        iqr = np.nanpercentile(pred, 75) - np.nanpercentile(pred, 25)
-        sigma = iqr / 1.349 if iqr and np.isfinite(iqr) and iqr > 0 else np.nanstd(pred)
-        sigma = sigma if sigma and np.isfinite(sigma) and sigma > 0 else 1.0
-        lo, hi = meta["goal"]
-        b = (hi - pred) / sigma if meta["dir"] == "high" else (pred - lo) / sigma
-        return b.clip(-3, 3)
+    if P is not None and not P.empty:
+        def goal_benefit(pred: pd.Series, meta: dict) -> pd.Series:
+            iqr = np.nanpercentile(pred, 75) - np.nanpercentile(pred, 25)
+            sigma = iqr / 1.349 if iqr and np.isfinite(iqr) and iqr > 0 else np.nanstd(pred)
+            sigma = sigma if sigma and np.isfinite(sigma) and sigma > 0 else 1.0
+            lo, hi = meta["goal"]
+            b = (hi - pred) / sigma if meta["dir"] == "high" else (pred - lo) / sigma
+            return b.clip(-3, 3)
 
-    r2_map = bundle.get("r2_map", {})
+        r2_map = bundle.get("r2_map", {})
 
-    for mkey, meta in MARKER_MAP.items():          # <— LOOP
-        tgt = meta.get("target")
-        if not tgt:
-            continue  # this marker has no model
+        for mkey, meta in MARKER_MAP.items():          # <— LOOP
+            tgt = meta.get("target")
+            if not tgt:
+                continue  # this marker has no model
 
-        # find prediction column name in P
-        possible_cols = [tgt, tgt.split(".")[-1], tgt.split("_")[-1]]
-        col = next((c for c in possible_cols if c in P.columns), None)
-        if col is None:
-            continue  # no matching model column
+            # find prediction column name in P
+            possible_cols = [tgt, tgt.split(".")[-1], tgt.split("_")[-1]]
+            col = next((c for c in possible_cols if c in P.columns), None)
+            if col is None:
+                continue  # no matching model column
 
-        # weights
-        sev_w = sev.get(mkey, {}).get("severity", 0.0)
-        if sev_w <= 0 and mkey != "glucose":
-            sev_w = 0.1
-        conf = clip01((float(r2_map.get(tgt, r2_map.get(col, 0.0))) - 0.10) / 0.20) if r2_map else 0.6
-        if conf <= 0:
-            continue
+            # weights
+            sev_w = sev.get(mkey, {}).get("severity", 0.0)
+            if sev_w <= 0 and mkey != "glucose":
+                sev_w = 0.1
+            conf = clip01((float(r2_map.get(tgt, r2_map.get(col, 0.0))) - 0.10) / 0.20) if r2_map else 0.6
+            if conf <= 0:
+                continue
 
-        # impact
-        pred = P[col]
-        benefit = goal_benefit(pred, meta)
-        imp = sev_w * conf * benefit
-        impact_total = impact_total.add(pd.Series(imp.values, index=P.index), fill_value=0.0)
+            # impact
+            pred = P[col]
+            benefit = goal_benefit(pred, meta)
+            imp = sev_w * conf * benefit
+            impact_total = impact_total.add(pd.Series(imp.values, index=P.index), fill_value=0.0)
 
-        # table for this marker
-        dfm = (
-            R_all.set_index("FoodCode")
-                 .assign(pred=pred, impact=imp)
-                 .sort_values("impact", ascending=False)
-                 [["Desc", "impact"]]
-                 .rename(columns={"impact": "impact_score"})
-                 .reset_index()
-        )
-        dfm["dedup_key"] = dfm["Desc"].map(_normalize_desc)
-        dfm = dfm.drop_duplicates("dedup_key", keep="first").drop(columns="dedup_key")
-        per_marker_tables[mkey] = dfm
+            # table for this marker
+            dfm = (
+                R_all.set_index("FoodCode")
+                     .assign(pred=pred, impact=imp)
+                     .sort_values("impact", ascending=False)
+                     [["Desc", "impact"]]
+                     .rename(columns={"impact": "impact_score"})
+                     .reset_index()
+            )
+            dfm["dedup_key"] = dfm["Desc"].map(_normalize_desc)
+            dfm = dfm.drop_duplicates("dedup_key", keep="first").drop(columns="dedup_key")
+            per_marker_tables[mkey] = dfm
 # <— end of loop/block
 
 
