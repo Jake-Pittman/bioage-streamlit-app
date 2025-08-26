@@ -73,6 +73,18 @@ def _dedupe_by_desc(df: pd.DataFrame) -> pd.DataFrame:
     R = R.drop_duplicates("dedup_key", keep="first").drop(columns="dedup_key")
     return R
 
+WHOLE_FOODS_BAD = re.compile(
+    r"\b(margarine|made with|broth|sauce|dressing|gravy|salad|soup|mix|mixes|"
+    r"polishings|cereal|bran|baby ?food|formula|powder|bar|chips|cookie|cake|pie|"
+    r"pudding|fried|battered|breaded)\b", re.I
+)
+def filter_whole_foods(df: pd.DataFrame) -> pd.DataFrame:
+    if "Desc" not in df.columns: return df
+    return df[
+        ~df["Desc"].astype(str).str.contains(WHOLE_FOODS_BAD, na=False)
+        & ~df["tags"].fillna("").str.contains(r"cereal_fortified|oil_fat_sauce|baby", case=False, regex=True)
+    ]
+
 # -----------------------------------------------------------------------------
 # Loaders
 # -----------------------------------------------------------------------------
@@ -107,60 +119,57 @@ def load_catalog() -> pd.DataFrame | None:
 @st.cache_data(show_spinner=False)
 def load_fnd_features() -> pd.DataFrame | None:
     """
-    Loads FoodCode + NUTR_* features for model inputs.
-
-    Search order:
-      1) {root}/processed/FNDDS_MASTER_PER100G.parquet
-      2) $FNDDS_PARQUET if set
-      3) /mnt/data/FNDDS_MASTER_PER100G.parquet
-      4) {root}/FNDDS_MASTER_PER100G.parquet
-      5) app_assets/food_catalog.parquet (fallback if it already contains NUTR_* cols)
+    Load the FNDDS per-100g parquet and normalize columns so that:
+      - FoodCode is Int64
+      - Nutrient columns exist as UPPERCASE 'NUTR_*'
+    Searches multiple likely locations.
     """
-    candidates: list[Path] = []
+    # candidate locations
+    candidates = [
+        PROC / "FNDDS_MASTER_PER100G.parquet",
+        root / "processed" / "FNDDS_MASTER_PER100G.parquet",
+        Path("/mnt/data/FNDDS_MASTER_PER100G.parquet"),
+    ]
+    src = next((p for p in candidates if p.exists()), None)
+    if src is None:
+        st.sidebar.error("FNDDS parquet not found in processed/ or /mnt/data.")
+        return None
 
-    # 1) standard processed path
-    if FND_PARQUET.exists():
-        candidates.append(FND_PARQUET)
+    fnd = pd.read_parquet(src)
 
-    # 2) explicit path via env
-    env_p = os.environ.get("FNDDS_PARQUET")
-    if env_p:
-        p = Path(env_p)
-        if p.exists():
-            candidates.append(p)
+    # --- normalize FoodCode
+    fc_col = None
+    for c in fnd.columns:
+        if str(c).lower().replace("_", "") == "foodcode":
+            fc_col = c; break
+    if fc_col and fc_col != "FoodCode":
+        fnd = fnd.rename(columns={fc_col: "FoodCode"})
+    if "FoodCode" not in fnd.columns:
+        st.sidebar.error("FNDDS parquet has no FoodCode column.")
+        return None
+    fnd["FoodCode"] = pd.to_numeric(fnd["FoodCode"], errors="coerce").astype("Int64")
 
-    # 3) common runtime upload location (your case)
-    mnt_p = Path("/mnt/data/FNDDS_MASTER_PER100G.parquet")
-    if mnt_p.exists():
-        candidates.append(mnt_p)
+    # --- ensure we have uppercase NUTR_* columns
+    nutr_cols = [c for c in fnd.columns if str(c).upper().startswith("NUTR_")]
+    if not nutr_cols:
+        # if there are lower-case nutr_ columns, uppercase them
+        lc = [c for c in fnd.columns if str(c).lower().startswith("nutr_")]
+        if lc:
+            fnd = fnd.rename(columns={c: str(c).upper() for c in lc})
+            nutr_cols = [str(c).upper() for c in lc]
+        else:
+            # last resort: create NUTR_* aliases for every numeric column (except FoodCode)
+            for c in list(fnd.columns):
+                if c == "FoodCode":
+                    continue
+                if pd.api.types.is_numeric_dtype(fnd[c]):
+                    alias = "NUTR_" + re.sub(r"[^A-Za-z0-9]+", "_", str(c)).upper()
+                    if alias not in fnd.columns:
+                        fnd[alias] = fnd[c]
+            nutr_cols = [c for c in fnd.columns if str(c).upper().startswith("NUTR_")]
 
-    # 4) repo root (sometimes people drop it here)
-    root_p = root / "FNDDS_MASTER_PER100G.parquet"
-    if root_p.exists():
-        candidates.append(root_p)
-
-    # Try to read any of the above
-    for path in candidates:
-        try:
-            df = pd.read_parquet(path)
-        except Exception:
-            continue
-
-        # Standardize key columns
-        df = df.copy()
-        # make sure FoodCode is numeric + nullable int
-        if "FoodCode" in df.columns:
-            df["FoodCode"] = pd.to_numeric(df["FoodCode"], errors="coerce").astype("Int64")
-
-        # rename nutr_* → NUTR_* (case-insensitive) so they match model features
-        ren = {c: c.upper() for c in df.columns if str(c).lower().startswith("nutr_")}
-        if ren:
-            df = df.rename(columns=ren)
-
-        nutr_cols = [c for c in df.columns if str(c).startswith("NUTR_")]
-        if "FoodCode" in df.columns and nutr_cols:
-            st.sidebar.caption(f"FNDDS parquet: {path}  •  nutrients: {len(nutr_cols)}")
-            return df[["FoodCode"] + nutr_cols]
+    st.sidebar.caption(f"FNDDS parquet: {src} • nutrients: {len(nutr_cols)}")
+    return fnd[["FoodCode"] + nutr_cols].copy()
 
     # 5) Last resort: some catalogs already include NUTR_* columns
     if CAT_PARQUET.exists():
@@ -620,44 +629,84 @@ def load_perfood_bundle():
     return {"dir": str(mdl_dir), "meta": meta, "features": features,
             "scaler": scaler, "models": models, "r2_map": r2_map}
 
-def build_feature_matrix(food_df: pd.DataFrame, fnd_df: pd.DataFrame | None, required: list[str] | None) -> pd.DataFrame | None:
+def build_feature_matrix(food_df: pd.DataFrame,
+                         fnd_df: pd.DataFrame | None,
+                         required: list[str] | None) -> pd.DataFrame | None:
+    """
+    Build X aligned to 'required' features (order preserved).
+    - Case/underscore-insensitive matching
+    - Missing features are added as 0.0 so the scaler/model shapes still match
+    """
+    if food_df is None or food_df.empty:
+        return None
+
+    # choose feature source (prefer FNDDS parquet)
+    base = fnd_df if (fnd_df is not None and not fnd_df.empty) else food_df
+    if "FoodCode" not in base.columns:
+        return None
+
+    base = base.copy()
+    base["FoodCode"] = pd.to_numeric(base["FoodCode"], errors="coerce").astype("Int64")
+
+    # If no explicit requirements, use all NUTR_* from the source
     if required is None:
-        src = fnd_df if (fnd_df is not None) else food_df
-        cols = [c for c in src.columns if str(c).startswith("NUTR_")]
-        if not cols: return None
-        required = cols
-    if fnd_df is not None and set(required).issubset(fnd_df.columns):
-        X = food_df[["FoodCode"]].merge(fnd_df[["FoodCode"] + list(required)], on="FoodCode", how="left")
-    else:
-        if not set(required).issubset(food_df.columns): return None
-        X = food_df[["FoodCode"] + list(required)].copy()
-    for c in required:
-        if c not in X.columns: X[c] = 0.0
-    return X.set_index("FoodCode")[list(required)].astype(float)
+        cols = [c for c in base.columns if str(c).upper().startswith("NUTR_")]
+        if not cols:
+            return None
+        return (base[["FoodCode"] + cols]
+                .set_index("FoodCode")[cols]
+                .astype(float))
+
+    # Helper: normalized key
+    def norm(s: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", str(s).lower())
+
+    # map available columns by normalized name
+    avail = {norm(c): c for c in base.columns}
+
+    # Build X with the required columns (fill missing with 0.0)
+    X = pd.DataFrame(index=pd.to_numeric(food_df["FoodCode"], errors="coerce").astype("Int64"))
+    for feat in required:
+        k = norm(feat)
+        # try exact, drop/add "nutr" prefix, and suffix matches
+        col = (avail.get(k) or
+               avail.get(k.replace("nutr", "")) or
+               avail.get("nutr" + k) or
+               next((orig for nk, orig in avail.items() if nk.endswith(k.replace("nutr", ""))), None))
+        if col is None:
+            X[feat] = 0.0
+        else:
+            X[feat] = base.set_index("FoodCode").reindex(X.index)[col].astype(float)
+
+    return X
+
 
 def predict_targets(bundle: dict, X: pd.DataFrame) -> pd.DataFrame:
-    """Apply scaler + each model; return DF indexed by FoodCode with columns named by NHANES target code."""
+    """Apply (optional) scaler + each LightGBM model."""
     if X is None or X.empty or not bundle or not bundle.get("models"):
         return pd.DataFrame(index=X.index if X is not None else None)
 
     scaler = bundle.get("scaler")
     if scaler is not None:
-        with contextlib.suppress(Exception):
+        try:
             Xs = pd.DataFrame(scaler.transform(X), index=X.index, columns=X.columns)
+        except Exception as e:
+            st.warning(f"Scaler transform failed ({e}); using raw features.")
+            Xs = X
     else:
         Xs = X
 
     preds = {}
     for stem, mdl in bundle["models"].items():
-        # joblib names like "lgbm_LBXSGL" → "LBXSGL"
-        code = stem.split(".")[0]
-        code = code.split("_")[-1] if "_" in code else code
         try:
-            preds[code] = np.asarray(mdl.predict(Xs)).astype(float)
+            # e.g., 'lgbm_LBXSGL' -> 'LBXSGL'
+            tgt = stem.split(".")[0].split("_")[-1]
+            preds[tgt] = np.asarray(mdl.predict(Xs)).astype(float)
         except Exception:
             continue
 
     return pd.DataFrame(preds, index=X.index) if preds else pd.DataFrame(index=X.index)
+
 
 # -----------------------------------------------------------------------------
 # UI
@@ -673,6 +722,8 @@ with st.sidebar:
     whole_only   = st.checkbox("Whole foods only (recommended)", value=True)
 
     st.markdown("**Preferences**")
+    whole_only = st.checkbox("Whole foods only", value=True)
+
     diet_pattern = st.selectbox("Diet pattern", ["Omnivore","Pescatarian","Vegetarian","Vegan","Mediterranean","DASH","Keto-lite"], index=0)
     exclusions   = st.multiselect("Hard exclusions", ["dairy-free","gluten-free","nut-free","shellfish-free","egg-free","soy-free","pork-free"], default=[])
     dislikes     = st.text_input("Avoid ingredients (comma-separated)", value="")
@@ -754,7 +805,11 @@ elif catalog is None or catalog.empty:
     st.error("Food catalog not found (app_assets/food_catalog.parquet).")
 else:
     # 1) filter + de-dupe + category
-    R_all = dedup_rank(catalog, include_tags, exclude_tags, whole_only=whole_only).copy()
+    base_cat = catalog.copy()
+    if whole_only:
+        base_cat = filter_whole_foods(base_cat)
+    R_all = dedup_rank(base_cat, include_tags, exclude_tags).copy()
+
     R_all["category"] = [coarse_category(d, t) for d, t in zip(R_all["Desc"], R_all["tags"])]
     # 2) user hard filters
     R_all = apply_hard_filters(R_all, diet_pattern, exclusions, dislikes)
