@@ -106,32 +106,79 @@ def load_catalog() -> pd.DataFrame | None:
 
 @st.cache_data(show_spinner=False)
 def load_fnd_features() -> pd.DataFrame | None:
-    # Prefer processed parquet with NUTR_* columns
-    if FND_PARQUET.exists():
-        fnd = pd.read_parquet(FND_PARQUET)
-        fnd["FoodCode"] = pd.to_numeric(fnd["FoodCode"], errors="coerce").astype("Int64")
-        nutr = [c for c in fnd.columns if str(c).startswith("NUTR_")]
-        return fnd[["FoodCode"] + nutr] if nutr else None
-    # Fallback: if catalog already carries NUTR_* columns
-    if CAT_PARQUET.exists():
-        c = pd.read_parquet(CAT_PARQUET)
-        c["FoodCode"] = pd.to_numeric(c["FoodCode"], errors="coerce").astype("Int64")
-        nutr = [x for x in c.columns if str(x).startswith("NUTR_")]
-        return c[["FoodCode"] + nutr] if nutr else None
-    return None
+    """
+    Loads FoodCode + NUTR_* features for model inputs.
 
-def normalize_labs(df_in: pd.DataFrame, schema: dict) -> pd.DataFrame:
-    df = df_in.copy()
-    alias_map = {a.lower(): std for std, meta in schema.items() for a in meta.get("aliases", [])}
-    rename = {col: alias_map[col.lower()] for col in df.columns if col.lower() in alias_map}
-    if rename:
-        df = df.rename(columns=rename)
-    keep = list(schema.keys())
-    present = [c for c in keep if c in df.columns]
-    out = df[present].copy()
-    for c in present:
-        out[c] = pd.to_numeric(out[c], errors="coerce")
-    return out
+    Search order:
+      1) {root}/processed/FNDDS_MASTER_PER100G.parquet
+      2) $FNDDS_PARQUET if set
+      3) /mnt/data/FNDDS_MASTER_PER100G.parquet
+      4) {root}/FNDDS_MASTER_PER100G.parquet
+      5) app_assets/food_catalog.parquet (fallback if it already contains NUTR_* cols)
+    """
+    candidates: list[Path] = []
+
+    # 1) standard processed path
+    if FND_PARQUET.exists():
+        candidates.append(FND_PARQUET)
+
+    # 2) explicit path via env
+    env_p = os.environ.get("FNDDS_PARQUET")
+    if env_p:
+        p = Path(env_p)
+        if p.exists():
+            candidates.append(p)
+
+    # 3) common runtime upload location (your case)
+    mnt_p = Path("/mnt/data/FNDDS_MASTER_PER100G.parquet")
+    if mnt_p.exists():
+        candidates.append(mnt_p)
+
+    # 4) repo root (sometimes people drop it here)
+    root_p = root / "FNDDS_MASTER_PER100G.parquet"
+    if root_p.exists():
+        candidates.append(root_p)
+
+    # Try to read any of the above
+    for path in candidates:
+        try:
+            df = pd.read_parquet(path)
+        except Exception:
+            continue
+
+        # Standardize key columns
+        df = df.copy()
+        # make sure FoodCode is numeric + nullable int
+        if "FoodCode" in df.columns:
+            df["FoodCode"] = pd.to_numeric(df["FoodCode"], errors="coerce").astype("Int64")
+
+        # rename nutr_* → NUTR_* (case-insensitive) so they match model features
+        ren = {c: c.upper() for c in df.columns if str(c).lower().startswith("nutr_")}
+        if ren:
+            df = df.rename(columns=ren)
+
+        nutr_cols = [c for c in df.columns if str(c).startswith("NUTR_")]
+        if "FoodCode" in df.columns and nutr_cols:
+            st.sidebar.caption(f"FNDDS parquet: {path}  •  nutrients: {len(nutr_cols)}")
+            return df[["FoodCode"] + nutr_cols]
+
+    # 5) Last resort: some catalogs already include NUTR_* columns
+    if CAT_PARQUET.exists():
+        try:
+            c = pd.read_parquet(CAT_PARQUET)
+            c["FoodCode"] = pd.to_numeric(c["FoodCode"], errors="coerce").astype("Int64")
+            ren = {x: x.upper() for x in c.columns if str(x).lower().startswith("nutr_")}
+            if ren:
+                c = c.rename(columns=ren)
+            nutr_cols = [x for x in c.columns if str(x).startswith("NUTR_")]
+            if nutr_cols:
+                st.sidebar.caption(f"FNDDS from catalog.parquet • nutrients: {len(nutr_cols)}")
+                return c[["FoodCode"] + nutr_cols]
+        except Exception:
+            pass
+
+    st.sidebar.warning("No NUTR_* features found. Place FNDDS_MASTER_PER100G.parquet in /processed or /mnt/data, or set $FNDDS_PARQUET.")
+    return None
 
 # -----------------------------------------------------------------------------
 # PhenoAge (Levine)
