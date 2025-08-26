@@ -920,7 +920,7 @@ else:
                     break
 
         if col is None:
-            continue  # no matching model column
+           # no matching model column
 
         pred = P[col]
 
