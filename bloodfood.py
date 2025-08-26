@@ -397,15 +397,22 @@ def parse_pdf_labs(file_like) -> dict:
 
     for label, key in synonyms: from_text(label, key)
 
+    # extra ALP fallbacks (expanded onto multiple lines to avoid syntax error)
     if "alp" not in labs:
         m = re.search(r"(?i)\bALP\b[^\n]{0,40}?(-?\d+(?:\.\d+)?)", full_text)
-        if m:  with contextlib.suppress(Exception): labs["alp"] = float(m.group(1))
+        if m:
+            with contextlib.suppress(Exception):
+                labs["alp"] = float(m.group(1))
     if "alp" not in labs:
         m = re.search(r"(?i)alk[^\n]{0,80}?phos[^\n]{0,80}?(-?\d+(?:\.\d+)?)", full_text)
-        if m:  with contextlib.suppress(Exception): labs["alp"] = float(m.group(1))
+        if m:
+            with contextlib.suppress(Exception):
+                labs["alp"] = float(m.group(1))
     if "alp" not in labs:
         m = re.search(r"(?i)(alk(?:aline)?\s+phosph(?:atase|ate))[^\n]{0,60}?(-?\d+(?:\.\d+)?)", full_text)
-        if m:  with contextlib.suppress(Exception): labs["alp"] = float(m.group(2))
+        if m:
+            with contextlib.suppress(Exception):
+                labs["alp"] = float(m.group(2))
 
     if "lymphs_pct" in aux and "lymphs" not in labs:
         labs["lymphs"] = aux["lymphs_pct"]; evidence["lymphs"] = evidence.get("lymphs_pct",(labs["lymphs"],"% cell"))
@@ -571,13 +578,10 @@ _KNOWN_CODES = ["LBXSGL","LBXCRP","LBXSAL","LBXSCR","LBXWBCSI","LBXRDW","LBXSAPS
 
 def _stem_to_code(stem: str) -> str | None:
     u = re.sub(r"[^A-Z0-9]+","", str(stem).upper())
-    # if a full NHANES code is embedded, use it
     for code in _KNOWN_CODES:
         if code in u: return code
-    # else alias
     for alias, code in _MODEL_ALIAS_TO_CODE.items():
         if alias in u: return code
-    # last try: last token
     tok = (str(stem).split("_")[-1]).upper()
     return _MODEL_ALIAS_TO_CODE.get(tok)
 
@@ -635,7 +639,7 @@ def predict_targets(bundle: dict, X: pd.DataFrame) -> pd.DataFrame:
     loaded_codes = []
     for stem, mdl in bundle["models"].items():
         code = _stem_to_code(stem)
-        if not code:  # unknown target name; skip but keep note
+        if not code:
             continue
         try:
             preds[code] = np.asarray(mdl.predict(Xs)).astype(float)
@@ -817,7 +821,7 @@ else:
                 continue  # model not available
 
             sev_w = sev.get(mkey, {}).get("severity", 0.0)
-            if sev_w <= 0 and mkey != "glucose":  # small non-zero to still show variety
+            if sev_w <= 0 and mkey != "glucose":
                 sev_w = 0.1
             conf = clip01((float(r2_map.get(tgt, 0.0)) - 0.10) / 0.20) if r2_map else 0.6
             if conf <= 0:
@@ -837,7 +841,6 @@ else:
                      .rename(columns={"impact":"impact_score"})
                      .reset_index()
             )
-            # de-dupe inside each card
             dfm = _dedupe_by_desc(dfm)
             per_marker_tables[mkey] = dfm
 
@@ -873,7 +876,6 @@ else:
             if dfk is None or dfk.empty:
                 st.caption("No model or no strong matches for this marker.")
             else:
-                # drop rows already shown on earlier cards (by normalized description)
                 dfk = dfk.copy()
                 dfk["dedup_key"] = dfk["Desc"].map(_normalize_desc)
                 dfk = dfk[~dfk["dedup_key"].isin(shown_keys)]
