@@ -913,6 +913,17 @@ else:
         use_container_width=True
     )
 
+    # Ensure every marker has at least some recommendations by
+    # falling back to the overall top foods (same as category table).
+    fallback_df = (top_overall[["FoodCode", "Desc", "score_final"]]
+                          .rename(columns={"score_final": "score"}))
+    fallback_df["dedup_key"] = fallback_df["Desc"].map(_normalize_desc)
+    fallback_df = fallback_df.drop_duplicates("dedup_key", keep="first").drop(columns="dedup_key")
+    for mkey in MARKER_MAP.keys():
+        dfm = per_marker_tables.get(mkey)
+        if dfm is None or dfm.empty:
+            per_marker_tables[mkey] = fallback_df.copy()
+
     # 8) Marker cards (from per-marker impacts, if any)
     st.subheader("Foods by marker (model-targeted)")
     cols = st.columns(2); i = 0
@@ -933,9 +944,13 @@ else:
                 dfk["dedup_key"] = dfk["Desc"].map(_normalize_desc)
                 dfk = dfk.drop_duplicates("dedup_key", keep="first").drop(columns="dedup_key")
 
-                show = (dfk.sort_values("impact_score", ascending=False)
-                          .head(10)[["FoodCode","Desc","impact_score"]]
-                          .rename(columns={"impact_score":"impact"}))
+                if "impact_score" in dfk.columns:
+                    show = (dfk.sort_values("impact_score", ascending=False)
+                              .head(10)[["FoodCode","Desc","impact_score"]]
+                              .rename(columns={"impact_score":"impact"}))
+                else:
+                    show = (dfk.sort_values("score", ascending=True)
+                              .head(10)[["FoodCode","Desc","score"]])
                 st.dataframe(show, use_container_width=True, hide_index=True)
         i += 1
 
