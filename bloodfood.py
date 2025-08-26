@@ -4,23 +4,20 @@
 # - Blends BioAge score with per-marker impact + dietary preferences
 
 from __future__ import annotations
+
 import os, re, io, json, contextlib
 from pathlib import Path
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-
-# Sanity marker so we can see which build is running
-APP_BUILD = "bf-v2-loader"
-st.sidebar.caption(f"Build: {APP_BUILD}")
-
-
-
-# =============================================================================
+# -----------------------------------------------------------------------------
 # Page + Paths
-# =============================================================================
+# -----------------------------------------------------------------------------
 st.set_page_config(page_title="Blood→Food: BioAge + Marker Recs", layout="wide")
+
+APP_BUILD = "bf-v2-clean"
+st.sidebar.caption(f"Build: {APP_BUILD}")
 
 REPO_ROOT = Path(__file__).resolve().parent
 env_root  = os.environ.get("BIOAGE_ROOT")
@@ -38,20 +35,18 @@ CONSENSUS_CSV  = CORE / "consensus_food_scores.csv"
 GUARDRAILS_CSV = CORE / "core_food_scores_guardrails.csv"
 ATTR_CSV       = CORE / "core_food_attribution_top50_compact.csv"  # optional
 
-# =============================================================================
+# -----------------------------------------------------------------------------
 # Optional dependency: pdfplumber
-# =============================================================================
+# -----------------------------------------------------------------------------
 try:
     import pdfplumber
     HAS_PDFPLUMBER = True
 except Exception:
     HAS_PDFPLUMBER = False
 
-# =============================================================================
-
-
+# -----------------------------------------------------------------------------
 # Small helpers
-# =============================================================================
+# -----------------------------------------------------------------------------
 def robust_z(x: pd.Series) -> pd.Series:
     x = pd.to_numeric(x, errors="coerce").astype(float)
     med = np.nanmedian(x)
@@ -63,18 +58,9 @@ def robust_z(x: pd.Series) -> pd.Series:
 
 def clip01(v): return float(np.clip(v, 0.0, 1.0))
 
-def _dedupe_by_desc(df: pd.DataFrame) -> pd.DataFrame:
-    """Drop near-duplicate rows by normalized description."""
-    if "Desc" not in df.columns:
-        return df
-    df = df.copy()
-    df["dedup_key"] = df["Desc"].map(_normalize_desc)
-    df = df.drop_duplicates("dedup_key", keep="first")
-    return df
-
-# =============================================================================
+# -----------------------------------------------------------------------------
 # Loaders
-# =============================================================================
+# -----------------------------------------------------------------------------
 @st.cache_data(show_spinner=False)
 def load_lab_schema() -> dict:
     if LAB_SCHEMA_JS.exists():
@@ -102,6 +88,9 @@ def load_catalog() -> pd.DataFrame | None:
     cat["FoodCode"] = pd.to_numeric(cat["FoodCode"], errors="coerce").astype("Int64")
     if "tags" not in cat.columns:
         cat["tags"] = np.nan
+    # Ensure a score column exists
+    if "score" not in cat.columns:
+        cat["score"] = 0.0
     return cat
 
 @st.cache_data(show_spinner=False)
@@ -133,9 +122,9 @@ def normalize_labs(df_in: pd.DataFrame, schema: dict) -> pd.DataFrame:
         out[c] = pd.to_numeric(out[c], errors="coerce")
     return out
 
-# =============================================================================
+# -----------------------------------------------------------------------------
 # PhenoAge (Levine)
-# =============================================================================
+# -----------------------------------------------------------------------------
 def phenoage_from_row(row: pd.Series):
     """
     Inputs (clinical units): albumin g/dL, creat mg/dL, glucose mg/dL, CRP mg/L,
@@ -176,9 +165,9 @@ def phenoage_from_row(row: pd.Series):
     accel = pheno - age
     return float(np.clip(pheno, 0.0, 140.0)), float(np.clip(accel, -60.0, 90.0))
 
-# =============================================================================
+# -----------------------------------------------------------------------------
 # Food catalog helpers
-# =============================================================================
+# -----------------------------------------------------------------------------
 _STOPWORDS = re.compile(
     r"\b(ns as to form|nsf|nfs|assume.*?|fat not added in cooking|no added fat|"
     r"from (?:fresh|frozen|canned)|fresh|frozen|canned|raw|cooked|reconstituted|"
@@ -221,16 +210,16 @@ def coarse_category(desc: str, tags: str) -> str:
     return "other"
 
 def dedup_rank(df: pd.DataFrame, include_tags: str = "", exclude_tags: str = "") -> pd.DataFrame:
+    """De-dupe by description; include/exclude work on tags OR fallback to keywords in Desc."""
     R = df.copy()
 
     def row_has_token(row_text: str, token: str) -> bool:
         return token in (row_text or "").lower()
 
     def desc_has_keyword(desc: str, token: str) -> bool:
-        # word-boundary search; also matches plural (fish vs fishes)
         return re.search(rf"\b{re.escape(token)}(es|s)?\b", str(desc or ""), re.I) is not None
 
-    # --- Include filter: match tags OR fall back to description keywords
+    # Include filter: tags OR Desc keywords
     if include_tags.strip():
         inc = [t.strip().lower() for t in include_tags.split(",") if t.strip()]
         R = R[
@@ -243,7 +232,7 @@ def dedup_rank(df: pd.DataFrame, include_tags: str = "", exclude_tags: str = "")
             )
         ]
 
-    # --- Exclude filter: match tags OR fall back to description keywords
+    # Exclude filter: tags OR Desc keywords
     if exclude_tags.strip():
         exc = [t.strip().lower() for t in exclude_tags.split(",") if t.strip()]
         R = R[
@@ -256,21 +245,18 @@ def dedup_rank(df: pd.DataFrame, include_tags: str = "", exclude_tags: str = "")
             )
         ]
 
-    # (existing de-dupe/ranking)
     R["dedup_key"] = R["Desc"].map(_normalize_desc)
     R = R.sort_values(["score", "kcal_per_100g"], ascending=[True, True])
     R = R.drop_duplicates(subset="dedup_key", keep="first").drop(columns=["dedup_key"])
     return R.reset_index(drop=True)
 
-
-# =============================================================================
+# -----------------------------------------------------------------------------
 # PDF → labs → sanitize
-# =============================================================================
+# -----------------------------------------------------------------------------
 def parse_pdf_labs(file_like) -> dict:
     """
-    Returns a dict of raw extracted labs. Tries tables first, then text.
-    Handles ranges, units (mg/dL vs mg/L), and lymphocytes (# and %).
-    Keys returned when found (raw): albumin, creatinine, (fasting_)glucose, crp, wbc, lymphs or lymphs_abs, mcv, rdw, alp
+    Extract raw labs from a PDF. Tries tables first, then text; handles common unit quirks.
+    Keys returned when found: albumin, creatinine, (fasting_)glucose, crp, wbc, lymphs or lymphs_abs, mcv, rdw, alp
     """
     if not HAS_PDFPLUMBER:
         raise RuntimeError("pdfplumber not installed. Run: pip install pdfplumber")
@@ -280,40 +266,31 @@ def parse_pdf_labs(file_like) -> dict:
         # Albumin
         ("serum albumin", "albumin"), ("albumin, serum", "albumin"),
         ("albumin (serum)", "albumin"), ("alb", "albumin"), ("albumin", "albumin"),
-
         # Alkaline phosphatase
         ("alkaline phosphatase (total)", "alp"), ("alkaline phosphatase, total", "alp"),
         ("alkaline phosphatase (alp)", "alp"), ("alkaline phosphatase (alk phos)", "alp"),
-        ("alk phosphatase", "alp"), ("alk. phosphatase", "alp"),
-        ("alk phos", "alp"), ("alk-phos", "alp"),
+        ("alk phosphatase", "alp"), ("alk. phosphatase", "alp"), ("alk phos", "alp"), ("alk-phos", "alp"),
         ("alkaline phosphatase", "alp"), ("alkaline phosphate", "alp"), ("alp", "alp"),
-
         # CRP
         ("c-reactive protein, cardiac", "crp"), ("c-reactive protein (cardiac)", "crp"),
         ("c reactive protein, cardiac", "crp"), ("crp, cardiac", "crp"),
         ("high sensitivity crp", "crp"), ("hs-crp", "crp"), ("hscrp", "crp"),
         ("c-reactive protein", "crp"), ("c reactive protein", "crp"), ("crp", "crp"),
-
         # Glucose
         ("glucose, fasting", "fasting_glucose"), ("glucose (fasting)", "fasting_glucose"),
-        ("fasting glucose", "fasting_glucose"), ("glucose fasting", "fasting_glucose"),
-        ("glucose", "fasting_glucose"),
-
+        ("fasting glucose", "fasting_glucose"), ("glucose fasting", "fasting_glucose"), ("glucose", "fasting_glucose"),
         # WBC
         ("white blood cell count", "wbc"), ("white blood cells", "wbc"),
         ("white blood cell", "wbc"), ("wbc", "wbc"),
-
         # Lymphocytes
         ("lymphocytes absolute", "lymphs_abs"), ("absolute lymphocytes", "lymphs_abs"),
         ("abs lymphocytes", "lymphs_abs"), ("lymphs #", "lymphs_abs"),
         ("lymphocyte percent", "lymphs_pct"), ("lymphocytes percent", "lymphs_pct"),
         ("lymphocyte %", "lymphs_pct"), ("lymphocytes %", "lymphs_pct"),
         ("lymphocytes", "lymphs_pct"), ("lymphs", "lymphs_pct"),
-
         # RBC indices
         ("mean corpuscular volume", "mcv"), ("mcv", "mcv"),
         ("red cell distribution width", "rdw"), ("rdw", "rdw"),
-
         # Extras
         ("creatinine", "creatinine"), ("creat", "creatinine"),
         ("blood urea nitrogen", "bun"), ("bun", "bun"),
@@ -489,12 +466,12 @@ def sanitize_labs(labs: dict) -> dict:
     _clip("rdw", 8.0, 30.0)
     return x
 
-# =============================================================================
+# -----------------------------------------------------------------------------
 # Marker map & severity
-# =============================================================================
+# -----------------------------------------------------------------------------
 MARKER_MAP = {
     "glucose":         {"label":"Glucose",          "units":"mg/dL",  "dir":"high", "goal":(70, 99),   "target":"LBXSGL"},
-    "crp_mgL":         {"label":"CRP (hs)",         "units":"mg/L",   "dir":"high", "goal":(0.0, 3.0), "target":"LBXCRP"},  # may be missing
+    "crp_mgL":         {"label":"CRP (hs)",         "units":"mg/L",   "dir":"high", "goal":(0.0, 3.0), "target":"LBXCRP"},
     "albumin":         {"label":"Albumin",          "units":"g/dL",   "dir":"low",  "goal":(3.8, 5.0), "target":"LBXSAL"},
     "lymphocyte_pct":  {"label":"Lymphocytes",      "units":"%",      "dir":"low",  "goal":(20, 40),   "target":None},
     "rdw":             {"label":"RDW",              "units":"%",      "dir":"high", "goal":(11.5,14.5),"target":"LBXRDW"},
@@ -525,10 +502,9 @@ def compute_marker_severity(labs_row: pd.Series) -> dict:
         out[key] = {"value":val, "status":status, "severity":sev, "label":meta["label"], "units":meta["units"]}
     return out
 
-# =============================================================================
+# -----------------------------------------------------------------------------
 # Per-food predictor
-# =============================================================================
-# --- NEW: v2 loader; ignores old globals like PERFOOD_DIR/PERFOOD_ALT ---
+# -----------------------------------------------------------------------------
 @st.cache_data(show_spinner=False)
 def load_perfood_bundle(base_dir: Path | None = None):
     """
@@ -586,21 +562,9 @@ def load_perfood_bundle(base_dir: Path | None = None):
             if {"target", "r2"}.issubset(r2df.columns):
                 r2_map = dict(zip(r2df["target"], r2df["r2"]))
 
-    st.sidebar.caption(f"PerFood dir: {mdl_dir}")  # small breadcrumb
+    st.sidebar.caption(f"PerFood dir: {mdl_dir}")
     return {"dir": str(mdl_dir), "meta": meta, "features": features,
             "scaler": scaler, "models": models, "r2_map": r2_map}
-
-    # Feature names may live under different keys
-    features = meta.get("features") or meta.get("feature_names")
-    r2_map   = {}
-    with contextlib.suppress(Exception):
-        r2_csv = next((mdl_dir / "per_target_r2.csv",), None)
-        if r2_csv and r2_csv.exists():
-            r2 = pd.read_csv(r2_csv)
-            if {"target","r2"}.issubset(r2.columns):
-                r2_map = {str(t): float(r) for t, r in zip(r2["target"], r2["r2"])}
-
-    return {"dir": str(mdl_dir), "meta": meta, "features": features, "scaler": scaler, "models": models, "r2_map": r2_map}
 
 def build_feature_matrix(food_df: pd.DataFrame, fnd_df: pd.DataFrame | None, required: list[str] | None) -> pd.DataFrame | None:
     """Return DataFrame X with shape [n_foods, n_features] aligned to required features."""
@@ -635,7 +599,9 @@ def predict_targets(bundle: dict, X: pd.DataFrame) -> pd.DataFrame:
     preds = {}
     for tgt, mdl in bundle["models"].items():
         try:
-            preds[tgt.split(".")[0].split("_")[-1]] = np.asarray(mdl.predict(Xs)).astype(float)  # normalize stem to code if needed
+            # Example filenames: lgbm_LBXSGL.joblib → column "LBXSGL"
+            tgt_code = Path(tgt).stem.split("_")[-1]
+            preds[tgt_code] = np.asarray(mdl.predict(Xs)).astype(float)
         except Exception:
             continue
 
@@ -643,9 +609,9 @@ def predict_targets(bundle: dict, X: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(index=X.index)
     return pd.DataFrame(preds, index=X.index)
 
-# =============================================================================
+# -----------------------------------------------------------------------------
 # Preference filters
-# =============================================================================
+# -----------------------------------------------------------------------------
 _EXCL_PATTERNS = {
     "dairy-free":      re.compile(r"\b(milk|cheese|yogurt|kefir|cream|butter|whey|casein|ghee|custard|ice cream)\b", re.I),
     "gluten-free":     re.compile(r"\b(wheat|barley|rye|farro|couscous|bulgur|seitan)\b", re.I),
@@ -675,16 +641,16 @@ def apply_hard_filters(df: pd.DataFrame, diet_pattern: str, exclusions: list[str
             R = R[~desc.str.contains(bad_re)]
     return R
 
-# =============================================================================
+# -----------------------------------------------------------------------------
 # UI
-# =============================================================================
+# -----------------------------------------------------------------------------
 st.title("Blood→Food: BioAge + Marker-Targeted Recommendations")
 
 with st.sidebar:
     st.markdown("**Paths**")
     st.text(f"Root: {root}")
-    include_tags = st.text_input("Include tags (comma-separated)", value="")
-    exclude_tags = st.text_input("Exclude tags (comma-separated)", value="")
+    include_tags = st.text_input("Include tags/keywords (comma-separated)", value="")
+    exclude_tags = st.text_input("Exclude tags/keywords (comma-separated)", value="")
 
     st.markdown("**Preferences**")
     diet_pattern = st.selectbox("Diet pattern", ["Omnivore","Pescatarian","Vegetarian","Vegan","Mediterranean","DASH","Keto-lite"], index=0)
@@ -763,17 +729,16 @@ if parsed_df is None:
 elif catalog is None or catalog.empty:
     st.error("Food catalog not found (app_assets/food_catalog.parquet).")
 else:
-    # 1) filter + de-dupe + category
+    # 1) Filter + de-dupe + category
     R_all = dedup_rank(catalog, include_tags, exclude_tags).copy()
     R_all["category"] = [coarse_category(d, t) for d, t in zip(R_all["Desc"], R_all["tags"])]
-    # 2) user hard filters
+
+    # 2) Apply user hard filters
     R_all = apply_hard_filters(R_all, diet_pattern, exclusions, dislikes)
 
-    # 3) per-food predictions
-    # 3) per-food predictions
+    # 3) Per-food predictions
     P = None
-    bundle = load_perfood_bundle()  # no _v2, no args
-
+    bundle = load_perfood_bundle()
     if bundle is None:
         st.warning("Per-marker ML bundle not found. Skipping per-marker recommendations.")
     else:
@@ -785,10 +750,10 @@ else:
             P = predict_targets(bundle, X)
             st.caption(f"Loaded PerFood models from: {bundle['dir']}")
 
-    # 4) marker severity
+    # 4) Marker severity
     sev = compute_marker_severity(parsed_df.iloc[0])
 
-    # 5) marker impact
+    # 5) Marker impact from predictions
     impact_total = pd.Series(0.0, index=R_all["FoodCode"].astype("Int64"))
     per_marker_tables = {}
 
@@ -813,16 +778,16 @@ else:
             if sev_w <= 0 and mkey != "glucose":
                 sev_w = 0.1
             conf = clip01((float(r2_map.get(tgt, 0.0)) - 0.10) / 0.20) if r2_map else 0.6
-            if conf <= 0:
-                continue
 
             pred = P[tgt]
             benefit = goal_benefit(pred, meta)
             imp = sev_w * conf * benefit
 
+            # accumulate total impact
             impact_total = impact_total.add(pd.Series(imp.values, index=P.index), fill_value=0.0)
 
-             dfm = (
+            # build per-marker table
+            dfm = (
                 R_all.set_index("FoodCode")
                     .assign(pred=pred, impact=imp)
                     .sort_values("impact", ascending=False)
@@ -830,21 +795,18 @@ else:
                     .rename(columns={"impact":"impact_score"})
                     .reset_index()
             )
-
-# dedupe within a marker card by normalized description
+            # de-dupe within a card by normalized description
             dfm["dedup_key"] = dfm["Desc"].map(_normalize_desc)
             dfm = dfm.drop_duplicates("dedup_key", keep="first").drop(columns="dedup_key")
-
             per_marker_tables[mkey] = dfm
 
-
-    # 6) blend with BioAge score
+    # 6) Blend with BioAge score
     base = pd.to_numeric(R_all["score"], errors="coerce").astype(float)
     base_z = robust_z(base)
-    blended = w_bioage * base_z - w_marker * impact_total.reindex(R_all["FoodCode"].astype("Int64")).fillna(0.0).values
-    R_all["score_final"] = blended
+    impact_aligned = impact_total.reindex(R_all["FoodCode"].astype("Int64")).fillna(0.0).to_numpy()
+    R_all["score_final"] = w_bioage * base_z.to_numpy() - w_marker * impact_aligned
 
-    # 7) overall table
+    # 7) Overall table
     top_overall = R_all.sort_values("score_final", ascending=True).head(100).copy()
     st.markdown("**Top 100 overall (lower = better; blended BioAge + Marker)**")
     st.dataframe(
@@ -853,11 +815,9 @@ else:
         use_container_width=True
     )
 
-    # 8) marker cards
-# 8) Marker cards (from per-marker impacts, if any)
+    # 8) Marker cards (with cross-card de-dupe)
     st.subheader("Foods by marker (model-targeted)")
-
-    shown_keys = set()       # global dedupe across cards
+    shown_keys: set[str] = set()
     cols = st.columns(2); i = 0
 
     for mkey, meta in MARKER_MAP.items():
@@ -875,7 +835,6 @@ else:
                 if dfk is None or dfk.empty:
                     st.caption("No model or no strong matches for this marker.")
                 else:
-                    # drop rows already shown on earlier cards (by normalized description)
                     dfk = dfk.copy()
                     dfk["dedup_key"] = dfk["Desc"].map(_normalize_desc)
                     dfk = dfk[~dfk["dedup_key"].isin(shown_keys)]
@@ -886,38 +845,12 @@ else:
                               .rename(columns={"impact_score":"impact"}))
                     st.dataframe(show, use_container_width=True, hide_index=True)
 
-                    # remember what we used so later cards don’t repeat
+                    # remember the ones we showed so later cards don’t repeat them
                     shown_keys.update(dfk["Desc"].map(_normalize_desc).head(10))
 
         i += 1
 
-            continue
-
-    # 1) de-dupe within the card
-    dfk = _dedupe_by_desc(dfk)
-
-    # 2) de-dupe across cards (skip foods already shown on earlier, higher-severity cards)
-    if "dedup_key" not in dfk.columns:
-        dfk["dedup_key"] = dfk["Desc"].map(_normalize_desc)
-    dfk = dfk[~dfk["dedup_key"].isin(used_keys)]
-
-    # sort and take top-N
-    dfk = dfk.sort_values("impact_score", ascending=False).head(10)
-
-    # record the ones we just used so later cards won’t repeat them
-    used_keys |= set(dfk["dedup_key"].tolist())
-
-    with cols[i % 2]:
-        with st.container():
-            st.markdown(f"**{label}** — {glyph} {('%.2f' % val) if val is not None else '—'} {units}")
-            if dfk.empty:
-                st.caption("No unique picks after de-duplication.")
-            else:
-                show = dfk[["FoodCode","Desc","impact_score"]].rename(columns={"impact_score":"impact"})
-                st.dataframe(show, use_container_width=True, hide_index=True)
-    i += 1
-
-    # 9) category tabs
+    # 9) Category tabs
     st.subheader("Browse by category")
     tabs = st.tabs(["Protein","Fats","Fruit","Vegetables","Legume/Grains","Other"])
     CAT_ORDER = ["protein","fats","fruit","vegetables","legume_grains","other"]
@@ -940,3 +873,4 @@ else:
                     file_name=f"top_{cat}.csv",
                     key=f"dl_{cat}"
                 )
+
