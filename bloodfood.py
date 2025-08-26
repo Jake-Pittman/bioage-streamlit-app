@@ -894,7 +894,6 @@ else:
 
     # 8) Marker cards (from per-marker impacts, if any)
     st.subheader("Foods by marker (model-targeted)")
-    shown_keys = set()     # global de-dupe across cards
     cols = st.columns(2); i = 0
 
     for mkey, meta in MARKER_MAP.items():
@@ -911,15 +910,12 @@ else:
             else:
                 dfk = dfk.copy()
                 dfk["dedup_key"] = dfk["Desc"].map(_normalize_desc)
-                dfk = dfk[~dfk["dedup_key"].isin(shown_keys)]
                 dfk = dfk.drop_duplicates("dedup_key", keep="first").drop(columns="dedup_key")
 
                 show = (dfk.sort_values("impact_score", ascending=False)
                           .head(10)[["FoodCode","Desc","impact_score"]]
                           .rename(columns={"impact_score":"impact"}))
                 st.dataframe(show, use_container_width=True, hide_index=True)
-
-                shown_keys.update(show["Desc"].map(_normalize_desc))
         i += 1
 
     # 9) category tabs
