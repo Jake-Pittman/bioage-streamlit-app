@@ -866,26 +866,26 @@ else:
             tgt = meta.get("target")
         if not tgt:
             # after resolving `col` ...
-    if col is None:
-        # no model column for this marker → skip
-        pass
-    else:
-        pred = P[col]
-        benefit = goal_benefit(pred, meta)
-        imp = sev_w * conf * benefit
-        impact_total = impact_total.add(pd.Series(imp.values, index=P.index), fill_value=0.0)
+        if col is None:
+            # no model column for this marker → skip
+            pass
+        else:
+            pred = P[col]
+            benefit = goal_benefit(pred, meta)
+            imp = sev_w * conf * benefit
+            impact_total = impact_total.add(pd.Series(imp.values, index=P.index), fill_value=0.0)
 
-        dfm = (
-            R_all.set_index("FoodCode")
-                 .assign(pred=pred, impact=imp)
-                 .sort_values("impact", ascending=False)
-                 [["Desc","impact"]]
-                 .rename(columns={"impact":"impact_score"})
-                 .reset_index()
-        )
-        dfm["dedup_key"] = dfm["Desc"].map(_normalize_desc)
-        dfm = dfm.drop_duplicates("dedup_key", keep="first").drop(columns="dedup_key")
-        per_marker_tables[mkey] = dfm
+            dfm = (
+                R_all.set_index("FoodCode")
+                     .assign(pred=pred, impact=imp)
+                     .sort_values("impact", ascending=False)
+                     [["Desc","impact"]]
+                     .rename(columns={"impact":"impact_score"})
+                     .reset_index()
+            )
+            dfm["dedup_key"] = dfm["Desc"].map(_normalize_desc)
+            dfm = dfm.drop_duplicates("dedup_key", keep="first").drop(columns="dedup_key")
+            per_marker_tables[mkey] = dfm
 
 
         def _norm(s: str) -> str:
