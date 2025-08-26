@@ -267,14 +267,20 @@ def dedup_rank(df: pd.DataFrame, include_tags: str = "", exclude_tags: str = "")
         return token in str(desc or "").lower()
 
     if include_tags.strip():
-        inc = [t.strip().lower() for t in include_tags.split(",") if t.strip()]
+        raw = [t.strip().lower() for t in include_tags.split(",") if t.strip()]
+        inc = []
+        for t in raw:
+            inc.extend(_DISLIKE_SYNONYMS.get(t, [t]))
         R = R[
             R.apply(lambda r: any(row_has_token(r.get("tags",""), t) or
                                   desc_has_keyword(r.get("Desc",""), t) for t in inc), axis=1)
         ]
 
     if exclude_tags.strip():
-        exc = [t.strip().lower() for t in exclude_tags.split(",") if t.strip()]
+        raw = [t.strip().lower() for t in exclude_tags.split(",") if t.strip()]
+        exc = []
+        for t in raw:
+            exc.extend(_DISLIKE_SYNONYMS.get(t, [t]))
         R = R[
             ~R.apply(lambda r: any(row_has_token(r.get("tags",""), t) or
                                    desc_has_keyword(r.get("Desc",""), t) for t in exc), axis=1)
@@ -688,6 +694,13 @@ _DIET_BLOCK = {
     "Vegetarian":   re.compile(r"\b(beef|pork|chicken|turkey|lamb|veal|fish|salmon|tuna|shrimp|oyster|clam|crab|lobster)\b", re.I),
     "Pescatarian":  re.compile(r"\b(beef|pork|chicken|turkey|lamb|veal)\b", re.I),
 }
+
+_DISLIKE_SYNONYMS = {
+    "fish": [
+        "fish","salmon","tuna","sardine","sardines","anchovy","anchovies",
+        "mackerel","herring","trout","cod","halibut","tilapia","seafood"
+    ]
+}
 def apply_hard_filters(df: pd.DataFrame, diet_pattern: str, exclusions: list[str], dislikes: str) -> pd.DataFrame:
     R = df.copy()
     desc = R["Desc"].fillna("").astype(str)
@@ -697,9 +710,13 @@ def apply_hard_filters(df: pd.DataFrame, diet_pattern: str, exclusions: list[str
         ex_re = _EXCL_PATTERNS.get(ex)
         if ex_re is not None: R = R[~desc.str.contains(ex_re)]
     if dislikes.strip():
-        bads = [re.escape(x.strip()) for x in dislikes.split(",") if x.strip()]
-        if bads:
-            bad_re = re.compile(r"(" + "|".join(bads) + r")", re.I)
+        raw = [x.strip().lower() for x in dislikes.split(",") if x.strip()]
+        tokens = []
+        for t in raw:
+            tokens.extend(_DISLIKE_SYNONYMS.get(t, [t]))
+        if tokens:
+            bads = [re.escape(x) for x in tokens]
+            bad_re = re.compile(r"(?:" + "|".join(bads) + r")", re.I)
             R = R[~desc.str.contains(bad_re)]
     return R
 
