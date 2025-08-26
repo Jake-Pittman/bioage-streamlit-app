@@ -846,7 +846,14 @@ else:
     sev = compute_marker_severity(parsed_df.iloc[0])
 
     # 5) marker impact
-impact_total = pd.Series(0.0, index=R_all["FoodCode"].astype("Int64"))
+# Robust index for foods (works even if 'FoodCode' is missing)
+if "FoodCode" in R_all.columns:
+    food_index = pd.to_numeric(R_all["FoodCode"], errors="coerce").astype("Int64")
+else:
+    food_index = pd.Series(R_all.index, dtype="Int64", name="FoodCode")
+
+impact_total = pd.Series(0.0, index=food_index)
+
 per_marker_tables = {}
 
 if P is not None and not P.empty:
@@ -946,7 +953,8 @@ if P is not None and not P.empty:
     # 6) blend with BioAge score
     base = pd.to_numeric(R_all["score"], errors="coerce").astype(float)
     base_z = robust_z(base)
-    blended = w_bioage * base_z - w_marker * impact_total.reindex(R_all["FoodCode"].astype("Int64")).fillna(0.0).values
+    blended = w_bioage * base_z - w_marker * impact_total.reindex(food_index).fillna(0.0).values
+
     R_all["score_final"] = blended
 
     # 7) overall table
