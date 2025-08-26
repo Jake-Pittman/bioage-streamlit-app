@@ -511,15 +511,17 @@ def compute_marker_severity(labs_row: pd.Series) -> dict:
 def load_perfood_bundle(base_dir: Path | None = None):
     """
     Load per-marker ML bundle from models/PerFood (or models/Perfood).
-    Returns dict with: dir, meta, features, scaler, models, r2_map — or None.
+    Returns dict with: dir, meta, features (aligned to scaler), scaler, models, r2_map — or None.
     """
     base = Path(base_dir) if base_dir else (root / "models")
     mdl_dir = base / "PerFood"
-    if not mdl_dir.exists(): mdl_dir = base / "Perfood"
+    if not mdl_dir.exists():
+        mdl_dir = base / "Perfood"
     if not mdl_dir.exists():
         st.warning(f"PerFood models folder not found under {base}.")
         return None
 
+    # meta.json (optional)
     meta = {}
     meta_path = mdl_dir / "meta.json"
     if meta_path.exists():
@@ -527,21 +529,39 @@ def load_perfood_bundle(base_dir: Path | None = None):
             meta = json.load(open(meta_path))
     features = meta.get("features") or meta.get("feature_names")
 
+    # joblib
     try:
         from joblib import load as joblib_load
     except Exception:
         st.error("Missing dependency 'joblib'. Add it to requirements.txt and redeploy.")
         return None
 
+    # scaler (optional)
     scaler = None
     scal_path = mdl_dir / "X_scaler.joblib"
     if scal_path.exists():
         with contextlib.suppress(Exception):
             scaler = joblib_load(scal_path)
 
+    # Align features to scaler, if present
+    if scaler is not None:
+        f_in = getattr(scaler, "feature_names_in_", None)
+        if f_in is not None:
+            features = [str(x) for x in list(f_in)]
+        else:
+            n_in = int(getattr(scaler, "n_features_in_", 0) or 0)
+            if n_in > 0:
+                # If meta features length mismatches scaler, pad/truncate deterministically.
+                base_feats = (features or [])
+                if len(base_feats) != n_in:
+                    st.sidebar.warning(f"Aligning features to scaler: meta={len(base_feats)} vs scaler={n_in}")
+                features = (base_feats + [f"__PAD_{i}__" for i in range(n_in)])[:n_in]
+
+    # load all LightGBM models (*.joblib) except the scaler
     models = {}
     for p in mdl_dir.glob("*.joblib"):
-        if p.name == "X_scaler.joblib": continue
+        if p.name == "X_scaler.joblib":
+            continue
         try:
             models[p.stem] = joblib_load(p)
         except Exception as e:
@@ -551,6 +571,7 @@ def load_perfood_bundle(base_dir: Path | None = None):
         st.error(f"No *.joblib models found in {mdl_dir}.")
         return None
 
+    # per-target R² (optional)
     r2_map = {}
     r2_path = mdl_dir / "per_target_r2.csv"
     if r2_path.exists():
@@ -620,8 +641,35 @@ def build_feature_matrix(food_df: pd.DataFrame,
             X[feat] = base.set_index("FoodCode").reindex(X.index)[col].astype(float)
     return X
 
+# robust mapping from model filenames → NHANES codes
+_MODEL_ALIAS_TO_CODE = {
+    "LBXSGL":"LBXSGL","GLUCOSE":"LBXSGL","GLU":"LBXSGL",
+    "LBXCRP":"LBXCRP","CRP":"LBXCRP","HSCRP":"LBXCRP",
+    "LBXSAL":"LBXSAL","ALBUMIN":"LBXSAL","ALB":"LBXSAL",
+    "LBXSCR":"LBXSCR","CREATININE":"LBXSCR","CREAT":"LBXSCR","CREA":"LBXSCR",
+    "LBXWBCSI":"LBXWBCSI","WBC":"LBXWBCSI",
+    "LBXRDW":"LBXRDW","RDW":"LBXRDW",
+    "LBXSAPSI":"LBXSAPSI","ALP":"LBXSAPSI","ALKPHOS":"LBXSAPSI","ALKALINEPHOSPHATASE":"LBXSAPSI",
+    "LBXMCVSI":"LBXMCVSI","MCV":"LBXMCVSI",
+}
+_KNOWN_CODES = list({v for v in _MODEL_ALIAS_TO_CODE.values()})
+
+def _stem_to_code(stem: str) -> str | None:
+    s = re.sub(r"[^A-Z0-9]+","", str(stem).upper())
+    # exact code inside the stem
+    for code in _KNOWN_CODES:
+        if code in s:
+            return code
+    # alias inside the stem
+    for alias, code in _MODEL_ALIAS_TO_CODE.items():
+        if alias in s:
+            return code
+    # last-token alias fallback
+    last = (str(stem).split("_")[-1]).upper()
+    return _MODEL_ALIAS_TO_CODE.get(last)
+
 def predict_targets(bundle: dict, X: pd.DataFrame) -> pd.DataFrame:
-    """Apply (optional) scaler + each LightGBM model. Columns named by NHANES code."""
+    """Apply scaler (features already aligned) + each target model. Columns named by NHANES code."""
     if X is None or X.empty or not bundle or not bundle.get("models"):
         return pd.DataFrame(index=X.index if X is not None else None)
 
@@ -638,9 +686,7 @@ def predict_targets(bundle: dict, X: pd.DataFrame) -> pd.DataFrame:
     preds = {}
     loaded_codes = []
     for stem, mdl in bundle["models"].items():
-        code = _stem_to_code(stem)
-        if not code:
-            continue
+        code = _stem_to_code(stem) or stem.upper()  # never drop a model due to naming
         try:
             preds[code] = np.asarray(mdl.predict(Xs)).astype(float)
             loaded_codes.append(code)
@@ -650,6 +696,7 @@ def predict_targets(bundle: dict, X: pd.DataFrame) -> pd.DataFrame:
     if loaded_codes:
         st.sidebar.caption("Models loaded for: " + ", ".join(sorted(set(loaded_codes))))
     return pd.DataFrame(preds, index=X.index) if preds else pd.DataFrame(index=X.index)
+
 
 # =============================================================================
 # Preference filters
@@ -817,8 +864,27 @@ else:
         r2_map = bundle.get("r2_map", {})
         for mkey, meta in MARKER_MAP.items():
             tgt = meta.get("target")
-            if not tgt or tgt not in P.columns:
-                continue  # model not available
+        if not tgt:
+            continue
+
+        def _norm(s: str) -> str:
+            return re.sub(r"[^A-Z0-9]+","", str(s).upper())
+
+        col = None
+        if tgt in P.columns:
+            col = tgt
+        else:
+            nt = _norm(tgt)
+            for c in P.columns:
+                if nt in _norm(c):
+                    col = c
+                    break
+
+        if col is None:
+            continue  # no matching model column
+
+        pred = P[col]
+
 
             sev_w = sev.get(mkey, {}).get("severity", 0.0)
             if sev_w <= 0 and mkey != "glucose":
