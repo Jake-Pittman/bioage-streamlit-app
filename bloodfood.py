@@ -913,12 +913,35 @@ else:
         use_container_width=True
     )
 
+    # 7a) derive category tables and food set for marker cards
+    CAT_ORDER = ["protein","fats","fruit","vegetables","legume_grains","other"]
+    QUOTA = {"protein":5, "fats":5, "fruit":7, "vegetables":10, "legume_grains":4, "other":top_n_show}
+    category_tables: dict[str, pd.DataFrame] = {}
+    category_foods: set[int] = set()
+    for cat in CAT_ORDER:
+        sub = (R_all[R_all["category"] == cat]
+                    .sort_values("score_final")
+                    .head(QUOTA.get(cat, 10)))
+        if not sub.empty:
+            category_tables[cat] = sub
+            category_foods.update(sub["FoodCode"].dropna().astype(int).tolist())
+
+    if category_tables:
+        category_df = pd.concat(category_tables.values(), ignore_index=True)
+    else:
+        category_df = top_overall
+
     # Ensure every marker has at least some recommendations by
-    # falling back to the overall top foods (same as category table).
-    fallback_df = (top_overall[["FoodCode", "Desc", "score_final"]]
-                          .rename(columns={"score_final": "score"}))
+    # falling back to foods from the category table.
+    fallback_df = (category_df[["FoodCode", "Desc", "score_final"]]
+                           .rename(columns={"score_final": "score"}))
     fallback_df["dedup_key"] = fallback_df["Desc"].map(_normalize_desc)
     fallback_df = fallback_df.drop_duplicates("dedup_key", keep="first").drop(columns="dedup_key")
+
+    # restrict per-marker tables to foods in category tabs
+    for mkey, dfm in list(per_marker_tables.items()):
+        per_marker_tables[mkey] = dfm[dfm["FoodCode"].isin(category_foods)]
+
     for mkey in MARKER_MAP.keys():
         dfm = per_marker_tables.get(mkey)
         if dfm is None or dfm.empty:
@@ -957,14 +980,10 @@ else:
     # 9) category tabs
     st.subheader("Browse by category")
     tabs = st.tabs(["Protein","Fats","Fruit","Vegetables","Legume/Grains","Other"])
-    CAT_ORDER = ["protein","fats","fruit","vegetables","legume_grains","other"]
-    QUOTA = {"protein":5, "fats":5, "fruit":7, "vegetables":10, "legume_grains":4, "other":top_n_show}
     for tab, cat in zip(tabs, CAT_ORDER):
         with tab:
-            sub = (R_all[R_all["category"]==cat]
-                   .sort_values("score_final")
-                   .head(QUOTA.get(cat, 10)))
-            if sub.empty:
+            sub = category_tables.get(cat)
+            if sub is None or sub.empty:
                 st.info(f"No foods found for category: {cat.replace('_','/')}")
             else:
                 st.write(f"**Top {len(sub)} — {cat.replace('_','/').title()}**")
