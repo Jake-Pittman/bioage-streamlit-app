@@ -888,14 +888,12 @@ else:
             # table for this marker
             dfm = (
                 R_all.set_index("FoodCode")
-                     .assign(pred=pred, impact=imp)
-                     .sort_values("impact", ascending=False)
-                     [["Desc", "impact"]]
-                     .rename(columns={"impact": "impact_score"})
-                     .reset_index()
+                    .assign(pred=pred, impact=imp)
+                    .sort_values("impact", ascending=False)
+                    [["Desc", "impact"]]
+                    .rename(columns={"impact": "impact_score"})
+                    .reset_index()
             )
-            dfm["dedup_key"] = dfm["Desc"].map(_normalize_desc)
-            dfm = dfm.drop_duplicates("dedup_key", keep="first").drop(columns="dedup_key")
             per_marker_tables[mkey] = dfm
 
     # 6) blend with BioAge score
@@ -940,7 +938,9 @@ else:
 
     # restrict per-marker tables to foods in category tabs
     for mkey, dfm in list(per_marker_tables.items()):
-        per_marker_tables[mkey] = dfm[dfm["FoodCode"].isin(category_foods)]
+        dfm = dfm[dfm["FoodCode"].isin(category_foods)].copy()
+        dfm["dedup_key"] = dfm["Desc"].map(_normalize_desc)
+        per_marker_tables[mkey] = dfm.drop_duplicates("dedup_key", keep="first").drop(columns="dedup_key")
 
     for mkey in MARKER_MAP.keys():
         dfm = per_marker_tables.get(mkey)
