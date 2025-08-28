@@ -753,7 +753,10 @@ schema   = load_lab_schema()
 catalog  = load_catalog()
 fnd_nutr = load_fnd_features()
 
-parsed_df = None
+if "parsed_df" not in st.session_state:
+    st.session_state["parsed_df"] = None
+
+parsed_df = st.session_state["parsed_df"]
 if run_clicked:
     labs_dict = {}
     try:
@@ -784,6 +787,7 @@ if run_clicked:
             "wbc": labs_dict.get("wbc"),
         }
         parsed_df = pd.DataFrame([mapped])
+        st.session_state["parsed_df"] = parsed_df
 
 # ---- Labs & BioAge
 st.subheader("Parsed labs & BioAge")
