@@ -922,7 +922,9 @@ else:
                     .head(QUOTA.get(cat, 10)))
         if not sub.empty:
             category_tables[cat] = sub
-            category_foods.update(sub["FoodCode"].dropna().astype(int).tolist())
+            # normalize FoodCode to ints before collecting
+            codes = pd.to_numeric(sub["FoodCode"], errors="coerce").dropna().astype(int)
+            category_foods.update(codes.tolist())
 
     if category_tables:
         category_df = pd.concat(category_tables.values(), ignore_index=True)
@@ -938,7 +940,10 @@ else:
 
     # restrict per-marker tables to foods in category tabs
     for mkey, dfm in list(per_marker_tables.items()):
-        dfm = dfm[dfm["FoodCode"].isin(category_foods)].copy()
+        dfm = dfm.copy()
+        dfm["FoodCode"] = pd.to_numeric(dfm["FoodCode"], errors="coerce").astype("Int64")
+        if category_foods:
+            dfm = dfm[dfm["FoodCode"].isin(category_foods)]
         dfm["dedup_key"] = dfm["Desc"].map(_normalize_desc)
         per_marker_tables[mkey] = dfm.drop_duplicates("dedup_key", keep="first").drop(columns="dedup_key")
 
