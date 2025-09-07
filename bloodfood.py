@@ -872,8 +872,12 @@ else:
                 continue  # no matching model column
 
             # weights
-            sev_w = sev.get(mkey, {}).get("severity", 0.0)
-            if sev_w <= 0 and mkey != "glucose":
+            sev_info = sev.get(mkey, {})
+            sev_w = sev_info.get("severity", 0.0)
+            if sev_info.get("value") is None:
+                sev_w = 0.0  # ignore markers not present in labs
+            elif sev_w <= 0 and mkey != "glucose":
+                # give normal-but-present markers a small weight so they can still move
                 sev_w = 0.1
             if r2_map:
                 raw_conf = r2_map.get(tgt, r2_map.get(col))
@@ -903,8 +907,15 @@ else:
     # 6) blend with BioAge score
     base = pd.to_numeric(R_all["score"], errors="coerce").astype(float)
     base_z = robust_z(base)
-    impact_vec = impact_total.reindex(food_index).fillna(0.0).to_numpy()
-    R_all["score_final"] = w_bioage * base_z - w_marker * impact_vec
+
+    # normalize impact and scale weight by overall marker severity so that
+    # blood tests with more out-of-range markers influence the ranking more
+    impact_series = impact_total.reindex(food_index).fillna(0.0)
+    impact_z = robust_z(impact_series)
+    total_sev = sum(info.get("severity", 0.0) for info in sev.values() if info.get("value") is not None)
+    dynamic_w = w_marker * (1.0 + total_sev)
+
+    R_all["score_final"] = (w_bioage * base_z) - (dynamic_w * impact_z)
 
     # 7) overall table
     top_overall = R_all.sort_values("score_final", ascending=True).head(100).copy()
